@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  user-memory:
+    build: .
+    container_name: thinkdrop-user-memory-service
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./data:/app/data
+      - ./screenshots:/app/screenshots
+      - ./logs:/app/logs
+      - ./models:/app/models
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - HOST=0.0.0.0
+      - DB_PATH=/app/data/user_memory.duckdb
+      - API_KEY=${API_KEY:-your-secret-key-here}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      - MIN_SIMILARITY_THRESHOLD=${MIN_SIMILARITY_THRESHOLD:-0.3}
+      - HIGH_SIMILARITY_THRESHOLD=${HIGH_SIMILARITY_THRESHOLD:-0.7}
+      - EMBEDDING_CACHE_SIZE=${EMBEDDING_CACHE_SIZE:-1000}
+      - QUERY_CACHE_SIZE=${QUERY_CACHE_SIZE:-100}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001/service.health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - thinkdrop-network
+
+networks:
+  thinkdrop-network:
+    driver: bridge

@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+.yarn
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
+data/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+
+# Screenshots
+screenshots/
+
+# Models cache
+models/
+.cache/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
