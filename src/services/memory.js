@@ -61,11 +61,11 @@ class MemoryService {
             '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
             ${data.primary_intent ? `'${data.primary_intent}'` : 'NULL'},
             ${data.requires_memory_access || false},
-            ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, "''")}'` : 'NULL'},
-            '${text.replace(/'/g, "''")}',
-            '${metadataJson.replace(/'/g, "''")}',
+            ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, '\'\'')}'` : 'NULL'},
+            '${text.replace(/'/g, '\'\'')}',
+            '${metadataJson.replace(/'/g, '\'\'')}',
             ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
-            ${data.extractedText ? `'${data.extractedText.replace(/'/g, "''")}'` : 'NULL'},
+            ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
             list_value(${embeddingValues}),
             CURRENT_TIMESTAMP,
             CURRENT_TIMESTAMP
@@ -81,11 +81,11 @@ class MemoryService {
             '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
             ${data.primary_intent ? `'${data.primary_intent}'` : 'NULL'},
             ${data.requires_memory_access || false},
-            ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, "''")}'` : 'NULL'},
-            '${text.replace(/'/g, "''")}',
-            '${metadataJson.replace(/'/g, "''")}',
+            ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, '\'\'')}'` : 'NULL'},
+            '${text.replace(/'/g, '\'\'')}',
+            '${metadataJson.replace(/'/g, '\'\'')}',
             ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
-            ${data.extractedText ? `'${data.extractedText.replace(/'/g, "''")}'` : 'NULL'},
+            ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
             CURRENT_TIMESTAMP,
             CURRENT_TIMESTAMP
           )
@@ -104,10 +104,10 @@ class MemoryService {
             VALUES (
               '${entityId}',
               '${memoryId}',
-              '${entity.value.replace(/'/g, "''")}',
+              '${entity.value.replace(/'/g, '\'\'')}',
               '${entity.type}',
               '${entity.entity_type || entity.type}',
-              '${normalizedValue.replace(/'/g, "''")}'
+              '${normalizedValue.replace(/'/g, '\'\'')}'
             )
           `;
           await this.db.execute(entitySql);
@@ -305,21 +305,28 @@ class MemoryService {
     try {
       const userId = extractUserId(context);
 
-      // Verify memory exists
-      const existing = await this.retrieveMemory(memoryId, context);
+      // Get current memory data (verifies it exists and we need it for the update)
+      const currentMemorySQL = `SELECT * FROM memory WHERE id = '${memoryId}' AND user_id = '${userId}'`;
+      const currentMemoryResult = await this.db.query(currentMemorySQL);
+      
+      if (!currentMemoryResult || currentMemoryResult.length === 0) {
+        throw new Error(`Memory not found: ${memoryId}`);
+      }
+      
+      const currentMemory = currentMemoryResult[0];
 
       const updateFields = [];
       let regenerateEmbedding = false;
 
       if (updates.text) {
         const text = validateMemoryText(updates.text);
-        updateFields.push(`source_text = '${text.replace(/'/g, "''")}'`);
+        updateFields.push(`source_text = '${text.replace(/'/g, '\'\'')}'`);
         regenerateEmbedding = true;
       }
 
       if (updates.metadata) {
         const metadataJson = JSON.stringify(updates.metadata);
-        updateFields.push(`metadata = '${metadataJson.replace(/'/g, "''")}'`);
+        updateFields.push(`metadata = '${metadataJson.replace(/'/g, '\'\'')}'`);
       }
 
       if (updates.screenshot !== undefined) {
@@ -327,7 +334,7 @@ class MemoryService {
       }
 
       if (updates.extractedText !== undefined) {
-        updateFields.push(`extracted_text = ${updates.extractedText ? `'${updates.extractedText.replace(/'/g, "''")}'` : 'NULL'}`);
+        updateFields.push(`extracted_text = ${updates.extractedText ? `'${updates.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'}`);
       }
 
       updateFields.push('updated_at = CURRENT_TIMESTAMP');
@@ -340,11 +347,6 @@ class MemoryService {
 
       // Use a different approach - delete and insert to avoid DuckDB UPDATE constraint bug
       const deleteSQL = `DELETE FROM memory WHERE id = '${memoryId}' AND user_id = '${userId}'`;
-      
-      // Get current data first including embedding
-      const currentMemorySQL = `SELECT * FROM memory WHERE id = '${memoryId}' AND user_id = '${userId}'`;
-      const currentMemoryResult = await this.db.query(currentMemorySQL);
-      const currentMemory = currentMemoryResult[0];
       
       // Delete old record
       await this.db.execute(deleteSQL);
@@ -369,11 +371,11 @@ class MemoryService {
         ) VALUES (
           '${memoryId}',
           '${userId}',
-          '${updates.text ? validateMemoryText(updates.text).replace(/'/g, "''") : currentMemory.source_text.replace(/'/g, "''")}',
+          '${updates.text ? validateMemoryText(updates.text).replace(/'/g, '\'\'') : currentMemory.source_text.replace(/'/g, '\'\'')}',
           ${embeddingValue},
-          '${updates.metadata ? JSON.stringify(updates.metadata).replace(/'/g, "''") : (currentMemory.metadata || '{}').replace(/'/g, "''")}',
+          '${updates.metadata ? JSON.stringify(updates.metadata).replace(/'/g, '\'\'') : (currentMemory.metadata || '{}').replace(/'/g, '\'\'')}',
           ${updates.screenshot !== undefined ? (updates.screenshot ? `'${updates.screenshot}'` : 'NULL') : (currentMemory.screenshot ? `'${currentMemory.screenshot}'` : 'NULL')},
-          ${updates.extractedText !== undefined ? (updates.extractedText ? `'${updates.extractedText.replace(/'/g, "''")}'` : 'NULL') : (currentMemory.extracted_text ? `'${currentMemory.extracted_text.replace(/'/g, "''")}'` : 'NULL')},
+          ${updates.extractedText !== undefined ? (updates.extractedText ? `'${updates.extractedText.replace(/'/g, '\'\'')}'` : 'NULL') : (currentMemory.extracted_text ? `'${currentMemory.extracted_text.replace(/'/g, '\'\'')}'` : 'NULL')},
           'user_memory',
           '${new Date(currentMemory.created_at).toISOString().slice(0, 19).replace('T', ' ')}',
           CURRENT_TIMESTAMP
@@ -397,10 +399,10 @@ class MemoryService {
             VALUES (
               '${entityId}',
               '${memoryId}',
-              '${entity.value.replace(/'/g, "''")}',
+              '${entity.value.replace(/'/g, '\'\'')}',
               '${entity.type}',
               '${entity.entity_type || entity.type}',
-              '${normalizedValue.replace(/'/g, "''")}'
+              '${normalizedValue.replace(/'/g, '\'\'')}'
             )
           `;
           await this.db.execute(entitySql);
@@ -539,48 +541,110 @@ class MemoryService {
   }
 
   /**
-   * Classify if query is conversational
+   * Classify if query is conversational (context-aware)
    */
   classifyConversationalQuery(query, options = {}) {
     const queryLower = query.toLowerCase();
+    const context = options.context || {};
+    
+    // Check if conversation context exists
+    const hasSessionContext = !!(context.sessionId || options.sessionId);
+    const hasMessageHistory = context.messageCount > 0 || context.hasHistory;
+    const hasConversationContext = hasSessionContext && hasMessageHistory;
 
-    // Positional patterns
-    const positionalPatterns = [
-      /\b(first|last|earlier|previous|initial|latest)\b/i,
-      /\b(what did (i|we) (say|ask|discuss|mention))\b/i,
-      /\b(beginning|start|end)\b/i
+    // Conversational pronouns that reference shared context
+    const conversationalPronouns = /\b(we|our|you said|i said|you mentioned|you told|i asked|we discussed|we talked|we covered)\b/i;
+    
+    // Anaphoric references (pointing back to previous discourse)
+    const anaphoricReferences = /\b(that|this|it|those|these)\b.*\b(we|you|i)\b/i;
+    const demonstratives = /\b(that thing|this topic|those points|these ideas)\b/i;
+    
+    // Temporal references WITH conversational context
+    const temporalConversational = /\b(earlier|before|previously|just now|a moment ago|you just)\b.*\b(said|mentioned|told|discussed|explained)\b/i;
+    const temporalConversationalReverse = /\b(said|mentioned|told|discussed|explained)\b.*\b(earlier|before|previously|just now|a moment ago)\b/i;
+    
+    // Positional patterns - ONLY with conversational pronouns
+    const positionalWithContext = [
+      /\b(first|last|initial|latest)\b.*\b(we|you|i)\b.*\b(said|mentioned|discussed|talked)\b/i,
+      /\b(what did (i|we|you))\b.*\b(say|ask|discuss|mention|talk about)\b/i,
+      /\b(beginning|start|end)\b.*\b(of (our|the) (conversation|discussion|chat))\b/i,
+      /\b(go back to|return to|back to)\b.*\b(what (we|you|i))\b/i
     ];
 
-    // Topical patterns
-    const topicalPatterns = [
-      /\b(what (did|have) (we|i) (discuss|talk about|cover))\b/i,
-      /\b(topics (we|i) (discussed|covered|mentioned))\b/i,
-      /\b(what topics (did|have) (we|i) (discuss|cover|talk about))\b/i,
-      /\b(conversation about)\b/i
+    // Topical patterns - ONLY about OUR conversation
+    const topicalWithContext = [
+      /\b(what (did|have) (we|i|you))\b.*\b(discuss|talk about|cover|chat about)\b/i,
+      /\b(topics|things|points|issues)\b.*\b((we|i|you) (discussed|covered|mentioned|talked about))\b/i,
+      /\b(our (conversation|discussion|chat))\b.*\b(about|regarding|concerning)\b/i
     ];
 
-    // Overview patterns
-    const overviewPatterns = [
-      /\b(summarize|recap|sum up|overview)\b/i,
-      /\b(what (did|have) (we|i) (chat|talk) about)\b/i
+    // Overview patterns - ONLY about THIS conversation
+    const overviewWithContext = [
+      /\b(summarize|recap|sum up|overview of)\b.*\b(our|this|the)\b.*\b(conversation|discussion|chat)\b/i,
+      /\b(what (did|have) (we|i|you))\b.*\b(chat|talk)\b.*\babout\b/i,
+      /\b(give me (a|an))\b.*\b(summary|recap|overview)\b.*\b(of (our|this|the) (conversation|discussion))\b/i
     ];
+
+    // Discourse markers indicating reference to previous statements
+    const discourseMarkers = /\b(like (you|i) (said|mentioned)|as (you|i) (mentioned|said|explained)|you were saying|i was saying)\b/i;
 
     let classification = 'GENERAL';
     let confidence = 0.5;
-    let reasoning = 'No specific conversation patterns detected';
+    let reasoning = 'No conversational context or patterns detected';
 
-    if (positionalPatterns.some(p => p.test(queryLower))) {
-      classification = 'POSITIONAL';
-      confidence = 0.95;
-      reasoning = 'Query contains positional reference to conversation history';
-    } else if (topicalPatterns.some(p => p.test(queryLower))) {
-      classification = 'TOPICAL';
-      confidence = 0.90;
-      reasoning = 'Query asks about conversation topics';
-    } else if (overviewPatterns.some(p => p.test(queryLower))) {
-      classification = 'OVERVIEW';
-      confidence = 0.85;
-      reasoning = 'Query requests conversation summary';
+    // If no conversation context exists, be very strict
+    if (!hasConversationContext) {
+      // Only classify as conversational if there are VERY strong signals
+      if (discourseMarkers.test(queryLower) || 
+          conversationalPronouns.test(queryLower) && (temporalConversational.test(queryLower) || temporalConversationalReverse.test(queryLower))) {
+        classification = 'POSITIONAL';
+        confidence = 0.70;
+        reasoning = 'Strong conversational markers present, but no session context available';
+      } else {
+        confidence = 0.95;
+        reasoning = 'No conversation context exists - treating as general query';
+      }
+    } else {
+      // We have conversation context - check patterns
+      
+      // Check for discourse markers first (strongest signal)
+      if (discourseMarkers.test(queryLower)) {
+        classification = 'POSITIONAL';
+        confidence = 0.98;
+        reasoning = 'Explicit discourse marker referencing previous conversation';
+      }
+      // Positional with context
+      else if (positionalWithContext.some(p => p.test(queryLower)) || 
+               (temporalConversational.test(queryLower) || temporalConversationalReverse.test(queryLower))) {
+        classification = 'POSITIONAL';
+        confidence = 0.95;
+        reasoning = 'Positional reference to conversation history with context';
+      }
+      // Topical with context
+      else if (topicalWithContext.some(p => p.test(queryLower))) {
+        classification = 'TOPICAL';
+        confidence = 0.92;
+        reasoning = 'Query asks about topics discussed in our conversation';
+      }
+      // Overview with context
+      else if (overviewWithContext.some(p => p.test(queryLower))) {
+        classification = 'OVERVIEW';
+        confidence = 0.90;
+        reasoning = 'Query requests summary of our conversation';
+      }
+      // Anaphoric references with conversational pronouns
+      else if ((anaphoricReferences.test(queryLower) || demonstratives.test(queryLower)) && 
+               conversationalPronouns.test(queryLower)) {
+        classification = 'POSITIONAL';
+        confidence = 0.85;
+        reasoning = 'Anaphoric reference to previous conversation content';
+      }
+      // Has conversation context but no strong patterns
+      else if (conversationalPronouns.test(queryLower)) {
+        classification = 'GENERAL';
+        confidence = 0.60;
+        reasoning = 'Conversational pronouns present but no clear reference to conversation history';
+      }
     }
 
     const isConversational = classification !== 'GENERAL';
@@ -589,7 +653,12 @@ class MemoryService {
       isConversational,
       confidence,
       classification,
-      reasoning
+      reasoning,
+      contextInfo: {
+        hasSessionContext,
+        hasMessageHistory,
+        hasConversationContext
+      }
     };
   }
 }

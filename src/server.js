@@ -196,7 +196,23 @@ async function startServer() {
 
     // Start server
     app.listen(PORT, HOST, () => {
-      logger.info(`UserMemory service running on http://${HOST}:${PORT}`);
+      const serviceUrl = `http://${HOST}:${PORT}`;
+      
+      // Print formatted startup message
+      console.log('\n🧠 User Memory MCP Service is running');
+      console.log(`   URL: ${serviceUrl}`);
+      console.log(`   Health: ${serviceUrl}/service.health`);
+      console.log(`   Capabilities: ${serviceUrl}/service.capabilities`);
+      console.log('\n📊 Available Actions:');
+      console.log('   - POST /memory.store');
+      console.log('   - POST /memory.search');
+      console.log('   - POST /memory.retrieve');
+      console.log('   - POST /memory.update');
+      console.log('   - POST /memory.delete');
+      console.log('   - POST /memory.list');
+      console.log('   - POST /memory.classify-conversational-query\n');
+      
+      logger.info(`UserMemory service running on ${serviceUrl}`);
       logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
       logger.info(`Database: ${process.env.DB_PATH || './data/user_memory.duckdb'}`);
     });

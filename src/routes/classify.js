@@ -9,11 +9,13 @@ router.post('/memory.classify-conversational-query', async (req, res, next) => {
   try {
     const { payload, context, requestId } = req.body;
 
+    console.log('Context:', context);
+
     if (!payload.query) {
       throw new Error('Missing required field: query');
     }
 
-    const result = memoryService.classifyConversationalQuery(payload.query, payload);
+    const result = memoryService.classifyConversationalQuery(payload.query, { ...payload, context });
 
     res.json(formatMCPResponse(
       'memory.classify-conversational-query',
