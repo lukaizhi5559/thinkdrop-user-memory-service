@@ -1,4 +1,5 @@
 import { pipeline } from '@xenova/transformers';
+import { LRUCache } from 'lru-cache';
 import logger from '../utils/logger.js';
 
 class EmbeddingService {
@@ -6,8 +7,24 @@ class EmbeddingService {
     this.embedder = null;
     this.modelName = 'Xenova/all-MiniLM-L6-v2';
     this.isLoaded = false;
-    this.cache = new Map();
-    this.maxCacheSize = parseInt(process.env.EMBEDDING_CACHE_SIZE) || 1000;
+    
+    // LRU cache with TTL
+    const cacheSize = parseInt(process.env.EMBEDDING_CACHE_SIZE) || 1000;
+    const cacheTTL = parseInt(process.env.EMBEDDING_CACHE_TTL) || 86400000; // 24 hours in ms
+    
+    this.cache = new LRUCache({
+      max: cacheSize,
+      ttl: cacheTTL,
+      updateAgeOnGet: true,
+      allowStale: false
+    });
+    
+    // Cache statistics
+    this.cacheStats = {
+      hits: 0,
+      misses: 0,
+      totalRequests: 0
+    };
   }
 
   /**
@@ -55,10 +72,19 @@ class EmbeddingService {
 
     // Check cache
     const cacheKey = this.getCacheKey(text);
-    if (this.cache.has(cacheKey)) {
-      logger.debug('Embedding cache hit', { textLength: text.length });
-      return this.cache.get(cacheKey);
+    this.cacheStats.totalRequests++;
+    
+    const cachedEmbedding = this.cache.get(cacheKey);
+    if (cachedEmbedding) {
+      this.cacheStats.hits++;
+      logger.debug('⚡ Embedding cache hit', { 
+        textLength: text.length,
+        hitRate: (this.cacheStats.hits / this.cacheStats.totalRequests * 100).toFixed(2) + '%'
+      });
+      return cachedEmbedding;
     }
+    
+    this.cacheStats.misses++;
 
     try {
       const startTime = Date.now();
@@ -140,22 +166,17 @@ class EmbeddingService {
   }
 
   /**
-   * Get cache key for text
+   * Get cache key for text (normalized)
    */
   getCacheKey(text) {
-    // Simple hash for cache key
-    return text.slice(0, 100);
+    // Normalize text for better cache hits
+    return text.toLowerCase().trim().slice(0, 200);
   }
 
   /**
-   * Cache embedding with LRU eviction
+   * Cache embedding (LRU handles eviction automatically)
    */
   cacheEmbedding(key, embedding) {
-    if (this.cache.size >= this.maxCacheSize) {
-      // Remove oldest entry (first key)
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
-    }
     this.cache.set(key, embedding);
   }
 
@@ -171,10 +192,18 @@ class EmbeddingService {
    * Get cache statistics
    */
   getCacheStats() {
+    const hitRate = this.cacheStats.totalRequests > 0 
+      ? (this.cacheStats.hits / this.cacheStats.totalRequests) 
+      : 0;
+    
     return {
       size: this.cache.size,
-      maxSize: this.maxCacheSize,
-      hitRate: this.cache.size > 0 ? (this.cache.size / this.maxCacheSize) : 0
+      maxSize: this.cache.max,
+      hits: this.cacheStats.hits,
+      misses: this.cacheStats.misses,
+      totalRequests: this.cacheStats.totalRequests,
+      hitRate: (hitRate * 100).toFixed(2) + '%',
+      hitRateNumeric: hitRate
     };
   }
 

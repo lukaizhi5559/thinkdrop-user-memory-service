@@ -49,6 +49,7 @@ app.get('/service.health', async (req, res) => {
     const embeddingHealth = await embeddings.healthCheck();
     const dbStats = await db.getStats();
     const metrics = getMetrics();
+    const cacheStats = embeddings.getCacheStats();
 
     res.json({
       service: 'user-memory',
@@ -62,7 +63,14 @@ app.get('/service.health', async (req, res) => {
         requestCount: metrics.requestCount,
         errorRate: parseFloat(metrics.errorRate),
         avgResponseTime: metrics.avgResponseTime,
-        cacheHitRate: 0.65 // TODO: Implement actual cache hit rate
+        embeddingCache: {
+          size: cacheStats.size,
+          maxSize: cacheStats.maxSize,
+          hitRate: cacheStats.hitRate,
+          hits: cacheStats.hits,
+          misses: cacheStats.misses,
+          totalRequests: cacheStats.totalRequests
+        }
       }
     });
   } catch (error) {

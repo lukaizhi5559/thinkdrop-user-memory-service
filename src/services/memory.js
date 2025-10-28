@@ -20,6 +20,7 @@ class MemoryService {
    */
   async storeMemory(data, context = {}) {
     const startTime = Date.now();
+    const timings = {};
     
     try {
       // Validate input
@@ -38,13 +39,16 @@ class MemoryService {
       let embedding = null;
       let embeddingGenerated = false;
       try {
+        const embeddingStart = Date.now();
         const embeddingArray = await this.embeddings.generateEmbedding(text);
         embedding = embeddingArray;
         embeddingGenerated = true;
+        timings.embedding = Date.now() - embeddingStart;
       } catch (error) {
         logger.warn('Failed to generate embedding, storing without it', { 
           error: error.message 
         });
+        timings.embedding = 0;
       }
 
       // Prepare SQL with embedding
@@ -92,7 +96,9 @@ class MemoryService {
         `;
       }
 
+      const dbStart = Date.now();
       await this.db.execute(sql);
+      timings.dbInsert = Date.now() - dbStart;
 
       // Store entities
       for (const entity of entities) {
@@ -121,14 +127,14 @@ class MemoryService {
         }
       }
 
-      const elapsedMs = Date.now() - startTime;
+      timings.total = Date.now() - startTime;
 
-      logger.info('Memory stored successfully', {
+      logger.info('⏱️  Memory stored successfully', {
         memoryId,
         userId,
         entitiesCount: entities.length,
         hasEmbedding: embeddingGenerated,
-        elapsedMs
+        timings
       });
 
       return {
@@ -149,18 +155,27 @@ class MemoryService {
    */
   async searchMemories(query, options = {}, context = {}) {
     const startTime = Date.now();
+    const timings = {};
 
     try {
       const userId = extractUserId(context) || options.userId || 'default_user';
       const limit = options.limit || 25;
       const offset = options.offset || 0;
       const minSimilarity = options.minSimilarity || parseFloat(process.env.MIN_SIMILARITY_THRESHOLD) || 0.3;
+      const maxAgeDays = options.maxAgeDays || parseInt(process.env.MAX_AGE_DAYS) || 30;
 
       // Generate query embedding
+      const embeddingStart = Date.now();
       const queryEmbedding = await this.embeddings.generateEmbedding(query);
+      timings.embedding = Date.now() - embeddingStart;
       
-      // Build WHERE clause
+      // Build WHERE clause with maxAge filter
       let whereConditions = [`user_id = '${userId}'`];
+      
+      // Add maxAge filter to reduce search space
+      if (maxAgeDays > 0) {
+        whereConditions.push(`created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY`);
+      }
       
       if (options.filters) {
         if (options.filters.type) {
@@ -197,11 +212,14 @@ class MemoryService {
         OFFSET ${offset}
       `;
 
+      const dbStart = Date.now();
       const results = await this.db.query(sql);
+      timings.dbQuery = Date.now() - dbStart;
 
       // Filter by minimum similarity and fetch entities for each result
       const filteredResults = results.filter(r => r.similarity >= minSimilarity);
       
+      const enrichStart = Date.now();
       const enrichedResults = await Promise.all(
         filteredResults.map(async (result) => {
           const entitiesSql = `
@@ -227,20 +245,22 @@ class MemoryService {
           };
         })
       );
+      timings.enrichment = Date.now() - enrichStart;
 
-      const elapsedMs = Date.now() - startTime;
+      timings.total = Date.now() - startTime;
 
-      logger.info('Memory search completed', {
+      logger.info('⏱️  Memory search completed', {
         query,
         resultsCount: enrichedResults.length,
-        elapsedMs
+        maxAgeDays,
+        timings
       });
 
       return {
         results: enrichedResults,
         total: enrichedResults.length,
         query,
-        elapsedMs
+        timings
       };
     } catch (error) {
       logger.error('Memory search failed', { error: error.message });

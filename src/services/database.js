@@ -94,12 +94,18 @@ class DatabaseService {
       `);
       logger.info('Memory table created');
 
-      // Create indexes for memory table
+      // Create single-column indexes for memory table
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_id ON memory(user_id)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory(created_at)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_primary_intent ON memory(primary_intent)');
-      logger.info('Memory table indexes created');
+      
+      // Create composite indexes for common query patterns
+      await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory(user_id, created_at DESC)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_type ON memory(user_id, type)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_type_created ON memory(user_id, type, created_at DESC)');
+      
+      logger.info('Memory table indexes created (including composite indexes)');
 
       // Create memory_entities table
       logger.info('Creating memory_entities table...');
