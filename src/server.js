@@ -21,6 +21,8 @@ import updateRoute from './routes/update.js';
 import deleteRoute from './routes/delete.js';
 import listRoute from './routes/list.js';
 import classifyRoute from './routes/classify.js';
+import debugRoute from './routes/debug.js';
+import healthRoute from './routes/health.js';
 
 // Load environment variables
 dotenv.config();
@@ -157,6 +159,18 @@ app.get('/service.capabilities', (req, res) => {
             query: 'string (required)',
             sessionId: 'string (optional)'
           }
+        },
+        {
+          name: 'memory.debug-embedding',
+          description: 'Test embedding generation and view statistics',
+          inputSchema: {
+            text: 'string (required)'
+          }
+        },
+        {
+          name: 'memory.health-check',
+          description: 'Comprehensive health check for memory service',
+          inputSchema: {}
         }
       ],
       features: [
@@ -183,6 +197,8 @@ app.use(updateRoute);
 app.use(deleteRoute);
 app.use(listRoute);
 app.use(classifyRoute);
+app.use(debugRoute);
+app.use(healthRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);

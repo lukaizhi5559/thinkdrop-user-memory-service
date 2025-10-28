@@ -35,66 +35,54 @@ class MemoryService {
       // Normalize entities
       const entities = normalizeEntities(data.entities || []);
 
-      // Generate embedding
-      let embedding = null;
-      let embeddingGenerated = false;
+      console.log(`💾 [MEMORY-STORE] Storing memory for user: ${userId}`);
+      console.log(`📝 [MEMORY-STORE] Text: "${text.substring(0, 100)}..."`);
+      
+      // Generate embedding (REQUIRED - don't store without it)
+      let embedding;
       try {
+        if (!this.embeddings.isInitialized()) {
+          throw new Error('Embedding service not initialized');
+        }
+        
         const embeddingStart = Date.now();
-        const embeddingArray = await this.embeddings.generateEmbedding(text);
-        embedding = embeddingArray;
-        embeddingGenerated = true;
+        embedding = await this.embeddings.generateEmbedding(text);
         timings.embedding = Date.now() - embeddingStart;
-      } catch (error) {
-        logger.warn('Failed to generate embedding, storing without it', { 
-          error: error.message 
-        });
-        timings.embedding = 0;
+        
+        // Validate embedding
+        if (!Array.isArray(embedding) || embedding.length !== 384) {
+          throw new Error(`Invalid embedding: expected 384-dim array, got ${typeof embedding} with length ${embedding?.length}`);
+        }
+        
+        console.log(`✅ [MEMORY-STORE] Embedding generated: ${embedding.length} dimensions`);
+      } catch (embeddingError) {
+        console.error('❌ [MEMORY-STORE] Embedding generation failed:', embeddingError.message);
+        
+        // CRITICAL: Don't store memory without embedding
+        throw new Error(`Cannot store memory without embedding: ${embeddingError.message}`);
       }
 
-      // Prepare SQL with embedding
-      let sql;
-      if (embedding) {
-        // Use list_value to ensure proper type
-        const embeddingValues = embedding.map(v => v.toString()).join(',');
-        sql = `
-          INSERT INTO memory (
-            id, user_id, type, primary_intent, requires_memory_access,
-            suggested_response, source_text, metadata, screenshot, 
-            extracted_text, embedding, created_at, updated_at
-          ) VALUES (
-            '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
-            ${data.primary_intent ? `'${data.primary_intent}'` : 'NULL'},
-            ${data.requires_memory_access || false},
-            ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, '\'\'')}'` : 'NULL'},
-            '${text.replace(/'/g, '\'\'')}',
-            '${metadataJson.replace(/'/g, '\'\'')}',
-            ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
-            ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
-            list_value(${embeddingValues}),
-            CURRENT_TIMESTAMP,
-            CURRENT_TIMESTAMP
-          )
-        `;
-      } else {
-        sql = `
-          INSERT INTO memory (
-            id, user_id, type, primary_intent, requires_memory_access,
-            suggested_response, source_text, metadata, screenshot, 
-            extracted_text, created_at, updated_at
-          ) VALUES (
-            '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
-            ${data.primary_intent ? `'${data.primary_intent}'` : 'NULL'},
-            ${data.requires_memory_access || false},
-            ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, '\'\'')}'` : 'NULL'},
-            '${text.replace(/'/g, '\'\'')}',
-            '${metadataJson.replace(/'/g, '\'\'')}',
-            ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
-            ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
-            CURRENT_TIMESTAMP,
-            CURRENT_TIMESTAMP
-          )
-        `;
-      }
+      // Prepare SQL with embedding (always present now)
+      const embeddingValues = embedding.map(v => v.toString()).join(',');
+      const sql = `
+        INSERT INTO memory (
+          id, user_id, type, primary_intent, requires_memory_access,
+          suggested_response, source_text, metadata, screenshot, 
+          extracted_text, embedding, created_at, updated_at
+        ) VALUES (
+          '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
+          ${data.primary_intent ? `'${data.primary_intent}'` : 'NULL'},
+          ${data.requires_memory_access || false},
+          ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, '\'\'')}'` : 'NULL'},
+          '${text.replace(/'/g, '\'\'')}',
+          '${metadataJson.replace(/'/g, '\'\'')}',
+          ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
+          ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
+          list_value(${embeddingValues}),
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP
+        )
+      `;
 
       const dbStart = Date.now();
       await this.db.execute(sql);
@@ -129,20 +117,26 @@ class MemoryService {
 
       timings.total = Date.now() - startTime;
 
+      console.log(`✅ [MEMORY-STORE] Memory stored successfully in ${timings.total}ms`);
+      console.log(`📊 [MEMORY-STORE] Memory ID: ${memoryId}`);
+
       logger.info('⏱️  Memory stored successfully', {
         memoryId,
         userId,
         entitiesCount: entities.length,
-        hasEmbedding: embeddingGenerated,
+        hasEmbedding: true,
+        embeddingDimensions: embedding.length,
         timings
       });
 
       return {
         memoryId,
         stored: true,
-        embedding: embeddingGenerated,
+        embedding: embedding.slice(0, 5), // Return first 5 values for verification
+        embeddingDimensions: embedding.length,
         entities: entities.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        timings
       };
     } catch (error) {
       logger.error('Failed to store memory', { error: error.message });
@@ -164,10 +158,26 @@ class MemoryService {
       const minSimilarity = options.minSimilarity || parseFloat(process.env.MIN_SIMILARITY_THRESHOLD) || 0.3;
       const maxAgeDays = options.maxAgeDays || parseInt(process.env.MAX_AGE_DAYS) || 30;
 
+      console.log('🔍 [MEMORY-SEARCH] Starting search...');
+      console.log(`📝 [MEMORY-SEARCH] Query: "${query}"`);
+      console.log(`🎯 [MEMORY-SEARCH] Min similarity: ${minSimilarity}`);
+      console.log(`👤 [MEMORY-SEARCH] User ID: ${userId}`);
+
       // Generate query embedding
-      const embeddingStart = Date.now();
-      const queryEmbedding = await this.embeddings.generateEmbedding(query);
-      timings.embedding = Date.now() - embeddingStart;
+      let queryEmbedding;
+      try {
+        if (!this.embeddings.isInitialized()) {
+          throw new Error('Embedding service not initialized');
+        }
+        
+        const embeddingStart = Date.now();
+        queryEmbedding = await this.embeddings.generateEmbedding(query);
+        timings.embedding = Date.now() - embeddingStart;
+        console.log(`✅ [MEMORY-SEARCH] Query embedding generated: ${queryEmbedding.length} dimensions`);
+      } catch (embeddingError) {
+        console.error('❌ [MEMORY-SEARCH] Failed to generate query embedding:', embeddingError.message);
+        throw new Error(`Cannot search without query embedding: ${embeddingError.message}`);
+      }
       
       // Build WHERE clause with maxAge filter
       let whereConditions = [`user_id = '${userId}'`];
@@ -212,12 +222,58 @@ class MemoryService {
         OFFSET ${offset}
       `;
 
+      console.log('🔍 [MEMORY-SEARCH] Executing search query...');
+      
       const dbStart = Date.now();
       const results = await this.db.query(sql);
       timings.dbQuery = Date.now() - dbStart;
 
       // Filter by minimum similarity and fetch entities for each result
       const filteredResults = results.filter(r => r.similarity >= minSimilarity);
+      
+      const duration = Date.now() - startTime;
+      
+      console.log(`✅ [MEMORY-SEARCH] Found ${filteredResults.length} results in ${duration}ms`);
+      
+      // Log results for debugging
+      if (filteredResults.length > 0) {
+        console.log('📊 [MEMORY-SEARCH] Top results:');
+        filteredResults.slice(0, 3).forEach((result, idx) => {
+          console.log(`  ${idx + 1}. "${result.source_text.substring(0, 60)}..." (similarity: ${result.similarity.toFixed(3)})`);
+        });
+      } else {
+        console.warn('⚠️ [MEMORY-SEARCH] No results found. Checking database...');
+        
+        // Debug: Check if any memories exist
+        const totalMemories = await this.db.query(`SELECT COUNT(*) as count FROM memory WHERE user_id = '${userId}'`);
+        const withEmbeddings = await this.db.query(`SELECT COUNT(*) as count FROM memory WHERE user_id = '${userId}' AND embedding IS NOT NULL`);
+        
+        console.log('📊 [MEMORY-SEARCH] Debug info:');
+        console.log(`  Total memories for user: ${totalMemories[0].count}`);
+        console.log(`  Memories with embeddings: ${withEmbeddings[0].count}`);
+        console.log(`  Similarity threshold: ${minSimilarity}`);
+        
+        if (withEmbeddings[0].count > 0) {
+          // Check highest similarity
+          const bestMatch = await this.db.query(`
+            SELECT source_text, list_cosine_similarity(embedding, list_value(${embeddingValues})) as similarity
+            FROM memory
+            WHERE user_id = '${userId}' AND embedding IS NOT NULL
+            ORDER BY similarity DESC
+            LIMIT 1
+          `);
+          
+          if (bestMatch.length > 0) {
+            console.log(`  Best match similarity: ${bestMatch[0].similarity.toFixed(3)}`);
+            console.log(`  Best match text: "${bestMatch[0].source_text.substring(0, 60)}..."`);
+            
+            if (bestMatch[0].similarity < minSimilarity) {
+              console.warn(`⚠️ [MEMORY-SEARCH] Best match (${bestMatch[0].similarity.toFixed(3)}) below threshold (${minSimilarity})`);
+              console.warn('💡 [MEMORY-SEARCH] Consider lowering minSimilarity or improving query');
+            }
+          }
+        }
+      }
       
       const enrichStart = Date.now();
       const enrichedResults = await Promise.all(

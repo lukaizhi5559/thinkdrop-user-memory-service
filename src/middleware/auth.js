@@ -19,6 +19,7 @@ export function authMiddleware(req, res, next) {
 
   const token = authHeader.replace('Bearer ', '');
 
+  console.log('THE API KEYS STORED:', API_KEYS, token);
   if (!API_KEYS.includes(token)) {
     logger.warn('Invalid API key', { ip: req.ip });
     return res.status(401).json({

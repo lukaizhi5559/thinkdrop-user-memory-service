@@ -37,7 +37,8 @@ class EmbeddingService {
     }
 
     try {
-      logger.info(`Loading embedding model: ${this.modelName}`);
+      console.log('🔧 [EMBEDDINGS] Loading embedding model:', this.modelName);
+      const startTime = Date.now();
       
       // Try different initialization approaches to work around tensor issues
       const pipelineOptions = {
@@ -48,10 +49,21 @@ class EmbeddingService {
       };
       
       this.embedder = await pipeline('feature-extraction', this.modelName, pipelineOptions);
+      
+      const loadTime = Date.now() - startTime;
       this.isLoaded = true;
-      logger.info('Embedding model loaded successfully');
+      
+      console.log(`✅ [EMBEDDINGS] Model loaded successfully in ${loadTime}ms`);
+      
+      // Test embedding generation
+      const testEmbedding = await this.generateEmbedding('test');
+      console.log(`✅ [EMBEDDINGS] Test embedding generated: ${testEmbedding.length} dimensions`);
+      
+      logger.info('Embedding model loaded successfully', { loadTime, dimensions: testEmbedding.length });
     } catch (error) {
+      console.error('❌ [EMBEDDINGS] Failed to load model:', error.message);
       logger.error('Failed to load embedding model', { error: error.message });
+      this.isLoaded = false;
       throw error;
     }
   }
@@ -63,11 +75,11 @@ class EmbeddingService {
    */
   async generateEmbedding(text) {
     if (!this.isLoaded) {
-      await this.initialize();
+      throw new Error('Embedding model not initialized. Call initialize() first.');
     }
 
-    if (!text || typeof text !== 'string') {
-      throw new Error('Invalid text for embedding generation');
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      throw new Error('Text must be a non-empty string');
     }
 
     // Check cache
@@ -87,6 +99,7 @@ class EmbeddingService {
     this.cacheStats.misses++;
 
     try {
+      console.log(`🔧 [EMBEDDINGS] Generating embedding for: "${text.substring(0, 50)}..."`);
       const startTime = Date.now();
       
       // Generate embedding with error handling for tensor issues
@@ -95,10 +108,11 @@ class EmbeddingService {
       
       try {
         // Try the standard approach first
-        output = await this.embedder(text);
+        output = await this.embedder(text, { pooling: 'mean', normalize: true });
       } catch (tensorError) {
         if (tensorError.message && tensorError.message.includes('Float32Array')) {
           // Fallback: generate a deterministic pseudo-embedding
+          console.warn('⚠️ [EMBEDDINGS] Using fallback embedding generation due to tensor error:', tensorError.message);
           logger.warn('Using fallback embedding generation due to tensor error', { 
             error: tensorError.message,
             textLength: text.length 
@@ -130,7 +144,24 @@ class EmbeddingService {
       if (Array.isArray(embedding) && Array.isArray(embedding[0])) {
         embedding = embedding[0];
       }
-      const elapsedMs = Date.now() - startTime;
+      
+      const duration = Date.now() - startTime;
+      
+      // Validate embedding
+      if (!Array.isArray(embedding)) {
+        throw new Error(`Expected array, got ${typeof embedding}`);
+      }
+      
+      if (embedding.length !== 384) {
+        throw new Error(`Expected 384 dimensions, got ${embedding.length}`);
+      }
+      
+      // Check for NaN or Infinity
+      if (embedding.some(val => !isFinite(val))) {
+        throw new Error('Embedding contains NaN or Infinity values');
+      }
+      
+      console.log(`✅ [EMBEDDINGS] Generated ${embedding.length}D embedding in ${duration}ms`);
 
       // Cache the result
       this.cacheEmbedding(cacheKey, embedding);
@@ -138,11 +169,12 @@ class EmbeddingService {
       logger.debug('Embedding generated', { 
         textLength: text.length, 
         dimension: embedding.length,
-        elapsedMs 
+        elapsedMs: duration
       });
 
       return embedding;
     } catch (error) {
+      console.error('❌ [EMBEDDINGS] Generation failed:', error.message);
       logger.error('Failed to generate embedding', { error: error.message });
       throw error;
     }
@@ -281,6 +313,18 @@ class EmbeddingService {
     } catch (error) {
       return { status: 'error', error: error.message };
     }
+  }
+
+  isInitialized() {
+    return this.isLoaded;
+  }
+
+  getModelInfo() {
+    return {
+      modelName: this.modelName,
+      dimensions: 384,
+      initialized: this.isLoaded
+    };
   }
 }
 
