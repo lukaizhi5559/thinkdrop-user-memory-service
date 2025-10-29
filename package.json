@@ -29,7 +29,7 @@
     "@xenova/transformers": "2.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",
-    "duckdb": "^0.9.0",
+    "duckdb": "latest",
     "express": "^4.18.0",
     "helmet": "^7.0.0",
     "lru-cache": "^11.2.2",
