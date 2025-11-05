@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { getDatabaseService } from './services/database.js';
 import { getEmbeddingService } from './services/embeddings.js';
 import { getMetrics } from './middleware/metrics.js';
@@ -24,8 +26,10 @@ import classifyRoute from './routes/classify.js';
 import debugRoute from './routes/debug.js';
 import healthRoute from './routes/health.js';
 
-// Load environment variables
-dotenv.config();
+// Load environment variables from service directory
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
