@@ -8,6 +8,7 @@ import { getDatabaseService } from './services/database.js';
 import { getEmbeddingService } from './services/embeddings.js';
 import { getMetrics } from './middleware/metrics.js';
 import logger from './utils/logger.js';
+import { getMonitorService } from './monitor/monitorService.js';
 
 // Import middleware
 import authMiddleware from './middleware/auth.js';
@@ -222,6 +223,13 @@ async function startServer() {
     await embeddings.initialize();
     logger.info('Embedding service initialized');
 
+    // Start screen monitor if enabled
+    if (process.env.MONITOR_SCREEN_OCR === 'true') {
+      const monitor = getMonitorService();
+      await monitor.start();
+      logger.info('Screen OCR monitor started');
+    }
+
     // Start server
     app.listen(PORT, HOST, () => {
       const serviceUrl = `http://${HOST}:${PORT}`;
@@ -238,7 +246,15 @@ async function startServer() {
       console.log('   - POST /memory.update');
       console.log('   - POST /memory.delete');
       console.log('   - POST /memory.list');
-      console.log('   - POST /memory.classify-conversational-query\n');
+      console.log('   - POST /memory.classify-conversational-query');
+      if (process.env.MONITOR_SCREEN_OCR === 'true') {
+        console.log('\n👁️  Screen Monitor: ACTIVE');
+        console.log(`   Capture interval: ${process.env.SCREEN_CAPTURE_INTERVAL || 10000}ms`);
+        console.log(`   Diff threshold: ${process.env.SCREEN_CAPTURE_DIFF_THRESHOLD || 0.15}`);
+      } else {
+        console.log('\n👁️  Screen Monitor: DISABLED (set MONITOR_SCREEN_OCR=true to enable)');
+      }
+      console.log('');
       
       logger.info(`UserMemory service running on ${serviceUrl}`);
       logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -251,19 +267,19 @@ async function startServer() {
 }
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully...');
+async function gracefulShutdown(signal) {
+  logger.info(`${signal} received, shutting down gracefully...`);
+  if (process.env.MONITOR_SCREEN_OCR === 'true') {
+    const monitor = getMonitorService();
+    await monitor.stop();
+  }
   const db = getDatabaseService();
   await db.close();
   process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully...');
-  const db = getDatabaseService();
-  await db.close();
-  process.exit(0);
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Start the server only if not in test mode
 if (process.env.NODE_ENV !== 'test') {
