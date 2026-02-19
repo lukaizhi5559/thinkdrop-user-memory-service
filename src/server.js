@@ -9,6 +9,7 @@ import { getEmbeddingService } from './services/embeddings.js';
 import { getMetrics } from './middleware/metrics.js';
 import logger from './utils/logger.js';
 import { getMonitorService } from './monitor/monitorService.js';
+import { getRetentionService } from './services/retention.js';
 
 // Import middleware
 import authMiddleware from './middleware/auth.js';
@@ -57,6 +58,7 @@ app.get('/service.health', async (req, res) => {
     const dbStats = await db.getStats();
     const metrics = getMetrics();
     const cacheStats = embeddings.getCacheStats();
+    const retentionStatus = getRetentionService().getStatus();
 
     res.json({
       service: 'user-memory',
@@ -78,7 +80,8 @@ app.get('/service.health', async (req, res) => {
           misses: cacheStats.misses,
           totalRequests: cacheStats.totalRequests
         }
-      }
+      },
+      retention: retentionStatus
     });
   } catch (error) {
     logger.error('Health check failed', { error: error.message });
@@ -223,6 +226,10 @@ async function startServer() {
     await embeddings.initialize();
     logger.info('Embedding service initialized');
 
+    // Start data retention service
+    const retention = getRetentionService();
+    await retention.start();
+
     // Start screen monitor if enabled
     if (process.env.MONITOR_SCREEN_OCR === 'true') {
       const monitor = getMonitorService();
@@ -254,6 +261,16 @@ async function startServer() {
       } else {
         console.log('\n👁️  Screen Monitor: DISABLED (set MONITOR_SCREEN_OCR=true to enable)');
       }
+
+      const retentionStatus = getRetentionService().getStatus();
+      if (retentionStatus.enabled) {
+        console.log('\n🗂️  Data Retention: ACTIVE');
+        console.log(`   Max retention: ${retentionStatus.maxDays} days (${(retentionStatus.maxDays / 365).toFixed(1)} years)`);
+        console.log(`   Purge amount: ${retentionStatus.purgeDays} days when limit reached`);
+        console.log(`   Check interval: every ${retentionStatus.checkIntervalHours}h`);
+      } else {
+        console.log('\n🗂️  Data Retention: DISABLED (set RETENTION_ENABLED=true to enable)');
+      }
       console.log('');
       
       logger.info(`UserMemory service running on ${serviceUrl}`);
@@ -273,6 +290,8 @@ async function gracefulShutdown(signal) {
     const monitor = getMonitorService();
     await monitor.stop();
   }
+  const retention = getRetentionService();
+  await retention.stop();
   const db = getDatabaseService();
   await db.close();
   process.exit(0);

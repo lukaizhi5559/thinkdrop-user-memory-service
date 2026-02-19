@@ -49,6 +49,9 @@ class DatabaseService {
             // Create tables
             await this.createTables();
 
+            // Load VSS extension for HNSW vector indexing
+            await this.initVectorSearch();
+
             this.isInitialized = true;
             logger.info(`Database initialized successfully: ${this.dbPath}`);
             resolve();
@@ -125,6 +128,89 @@ class DatabaseService {
     } catch (error) {
       logger.error('Failed to create tables', { error: error.message, stack: error.stack });
       throw error;
+    }
+  }
+
+  /**
+   * Initialize the VSS extension and create HNSW index for vector similarity search.
+   * The index is rebuilt on each startup (safe approach — experimental persistence
+   * has WAL recovery issues that could corrupt data on crash).
+   */
+  async initVectorSearch() {
+    try {
+      // Install and load the VSS extension
+      await this.run('INSTALL vss');
+      await this.run('LOAD vss');
+      logger.info('VSS extension loaded');
+
+      // Drop existing HNSW index if it exists (rebuild fresh on each startup)
+      try {
+        await this.run('DROP INDEX IF EXISTS idx_memory_embedding_hnsw');
+      } catch (e) {
+        // Index may not exist yet — that's fine
+      }
+
+      // Check if there are any records with embeddings to index
+      const result = await this.all(
+        'SELECT COUNT(*) as count FROM memory WHERE embedding IS NOT NULL'
+      );
+      const count = Number(result[0]?.count || 0);
+
+      if (count > 0) {
+        // Create HNSW index with cosine distance metric
+        const startTime = Date.now();
+        await this.run(
+          'CREATE INDEX idx_memory_embedding_hnsw ON memory USING HNSW (embedding) WITH (metric = \'cosine\')'
+        );
+        const elapsed = Date.now() - startTime;
+        logger.info('HNSW vector index created', { records: count, buildTimeMs: elapsed });
+      } else {
+        logger.info('HNSW vector index skipped — no embeddings yet');
+      }
+
+      this.vssEnabled = true;
+    } catch (error) {
+      // VSS extension may not be available — fall back to brute-force search
+      logger.warn('VSS extension not available, falling back to brute-force vector search', {
+        error: error.message
+      });
+      this.vssEnabled = false;
+    }
+  }
+
+  /**
+   * Rebuild the HNSW index (call after bulk inserts or purges).
+   */
+  async rebuildHnswIndex() {
+    if (!this.vssEnabled) return;
+    try {
+      await this.run('DROP INDEX IF EXISTS idx_memory_embedding_hnsw');
+      const result = await this.all(
+        'SELECT COUNT(*) as count FROM memory WHERE embedding IS NOT NULL'
+      );
+      const count = Number(result[0]?.count || 0);
+      if (count > 0) {
+        const startTime = Date.now();
+        await this.run(
+          'CREATE INDEX idx_memory_embedding_hnsw ON memory USING HNSW (embedding) WITH (metric = \'cosine\')'
+        );
+        logger.info('HNSW vector index rebuilt', { records: count, buildTimeMs: Date.now() - startTime });
+      }
+    } catch (error) {
+      logger.error('Failed to rebuild HNSW index', { error: error.message });
+    }
+  }
+
+  /**
+   * Compact the HNSW index (prune deleted entries).
+   */
+  async compactHnswIndex() {
+    if (!this.vssEnabled) return;
+    try {
+      await this.run('PRAGMA hnsw_compact_index(\'idx_memory_embedding_hnsw\')');
+      logger.info('HNSW index compacted');
+    } catch (error) {
+      logger.warn('Failed to compact HNSW index', { error: error.message });
     }
   }
 

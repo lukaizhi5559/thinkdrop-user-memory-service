@@ -200,8 +200,10 @@ class MemoryService {
         ? `WHERE ${whereConditions.join(' AND ')} AND embedding IS NOT NULL` 
         : 'WHERE embedding IS NOT NULL';
 
-      // Search with similarity - use list_value to create proper FLOAT[384] type
+      // Search with similarity using array_cosine_distance (HNSW-accelerated when vss is loaded)
+      // cosine_distance = 0 means identical, 2 means opposite; similarity = 1 - distance
       const embeddingValues = queryEmbedding.map(v => v.toString()).join(',');
+      const queryVector = `[${embeddingValues}]::FLOAT[384]`;
       const sql = `
         SELECT 
           id,
@@ -210,10 +212,10 @@ class MemoryService {
           screenshot,
           extracted_text,
           created_at,
-          list_cosine_similarity(embedding, list_value(${embeddingValues})) as similarity
+          (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
         FROM memory
         ${whereClause}
-        ORDER BY list_cosine_similarity(embedding, list_value(${embeddingValues})) DESC
+        ORDER BY array_cosine_distance(embedding, ${queryVector})
         LIMIT ${limit}
         OFFSET ${offset}
       `;
@@ -252,10 +254,10 @@ class MemoryService {
         if (withEmbeddings[0].count > 0) {
           // Check highest similarity
           const bestMatch = await this.db.query(`
-            SELECT source_text, list_cosine_similarity(embedding, list_value(${embeddingValues})) as similarity
+            SELECT source_text, (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
             FROM memory
             WHERE user_id = '${userId}' AND embedding IS NOT NULL
-            ORDER BY similarity DESC
+            ORDER BY array_cosine_distance(embedding, ${queryVector})
             LIMIT 1
           `);
           
