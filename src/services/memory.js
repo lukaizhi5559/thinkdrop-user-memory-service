@@ -598,6 +598,64 @@ class MemoryService {
   }
 
   /**
+   * Get the most recent screen capture OCR text if it's fresh enough.
+   * Used by external services (e.g., screen_intelligence) to avoid redundant OCR.
+   * 
+   * @param {Object} options
+   * @param {number} options.maxAgeSeconds - Max age in seconds (default: 10)
+   * @param {string} options.userId - User ID filter
+   * @returns {Object|null} Recent OCR data or null if none fresh enough
+   */
+  async getRecentOcr(options = {}, context = {}) {
+    try {
+      // Screen captures are stored by the monitor under MONITOR_USER_ID (default: 'local_user')
+      const userId = options.userId || process.env.MONITOR_USER_ID || 'local_user';
+      const maxAgeSeconds = options.maxAgeSeconds || 10;
+
+      const sql = `
+        SELECT 
+          id,
+          source_text,
+          extracted_text,
+          metadata,
+          created_at
+        FROM memory
+        WHERE type = 'screen_capture'
+          AND user_id = '${userId}'
+          AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeSeconds}' SECOND
+        ORDER BY created_at DESC
+        LIMIT 1
+      `;
+
+      const results = await this.db.query(sql);
+
+      if (!results || results.length === 0) {
+        return null;
+      }
+
+      const row = results[0];
+      const metadata = parseMetadata(row.metadata);
+
+      return {
+        id: row.id,
+        text: row.extracted_text || row.source_text,
+        sourceText: row.source_text,
+        appName: metadata.appName || 'unknown',
+        windowTitle: metadata.windowTitle || 'unknown',
+        url: metadata.url || null,
+        files: metadata.files || [],
+        codeSnippets: metadata.codeSnippets || [],
+        ocrConfidence: metadata.ocrConfidence || null,
+        capturedAt: metadata.capturedAt || row.created_at,
+        ageMs: Date.now() - new Date(row.created_at).getTime()
+      };
+    } catch (error) {
+      logger.error('Failed to get recent OCR', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
    * Classify if query is conversational (context-aware)
    */
   classifyConversationalQuery(query, options = {}) {

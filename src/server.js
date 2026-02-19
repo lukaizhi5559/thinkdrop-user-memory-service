@@ -27,6 +27,7 @@ import listRoute from './routes/list.js';
 import classifyRoute from './routes/classify.js';
 import debugRoute from './routes/debug.js';
 import healthRoute from './routes/health.js';
+import recentOcrRoute from './routes/recentOcr.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -179,6 +180,13 @@ app.get('/service.capabilities', (req, res) => {
           name: 'memory.health-check',
           description: 'Comprehensive health check for memory service',
           inputSchema: {}
+        },
+        {
+          name: 'memory.getRecentOcr',
+          description: 'Get the most recent screen capture OCR text if fresh enough (avoids redundant OCR)',
+          inputSchema: {
+            maxAgeSeconds: 'number (optional, default: 10)'
+          }
         }
       ],
       features: [
@@ -207,6 +215,7 @@ app.use(listRoute);
 app.use(classifyRoute);
 app.use(debugRoute);
 app.use(healthRoute);
+app.use(recentOcrRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
@@ -254,6 +263,7 @@ async function startServer() {
       console.log('   - POST /memory.delete');
       console.log('   - POST /memory.list');
       console.log('   - POST /memory.classify-conversational-query');
+      console.log('   - POST /memory.getRecentOcr');
       if (process.env.MONITOR_SCREEN_OCR === 'true') {
         console.log('\n👁️  Screen Monitor: ACTIVE');
         console.log(`   Capture interval: ${process.env.SCREEN_CAPTURE_INTERVAL || 10000}ms`);
