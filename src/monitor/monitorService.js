@@ -1,6 +1,6 @@
 import { getActiveWindow, isSystemIdle } from './activeWindow.js';
 import { getScreenCaptureService } from './screenCapture.js';
-import { getOCRService } from './ocrService.js';
+import OCRService, { getOCRService } from './ocrService.js';
 import { getDatabaseService } from '../services/database.js';
 import { getEmbeddingService } from '../services/embeddings.js';
 import { generateMemoryId } from '../utils/helpers.js';
@@ -94,7 +94,7 @@ class MonitorService {
       }
 
       // Step 2: Get active window info
-      const { appName, windowTitle } = getActiveWindow();
+      const { appName, windowTitle, url } = await getActiveWindow();
 
       // Step 3: Check if window context changed
       const titleChanged = appName !== this.lastAppName || windowTitle !== this.lastWindowTitle;
@@ -139,12 +139,13 @@ class MonitorService {
       }
 
       // Step 6: Generate embedding and store
-      await this.storeCapture(appName, windowTitle, ocrResult);
+      await this.storeCapture(appName, windowTitle, ocrResult, url);
       this.captureCount++;
 
       logger.info('Screen capture stored', {
         appName,
         windowTitle: windowTitle.substring(0, 80),
+        url: url || undefined,
         ocrLength: ocrResult.text.length,
         confidence: ocrResult.confidence,
         totalCaptures: this.captureCount
@@ -158,28 +159,37 @@ class MonitorService {
 
   /**
    * Store a screen capture as a memory record.
+   * Processes raw OCR through cleanup pipeline before storing.
    */
-  async storeCapture(appName, windowTitle, ocrResult) {
+  async storeCapture(appName, windowTitle, ocrResult, url = null) {
     const memoryId = generateMemoryId();
     const userId = process.env.MONITOR_USER_ID || 'local_user';
 
-    // Build the text for embedding — structured for good semantic search
-    const embeddingText = `${appName}: ${windowTitle}\n${ocrResult.text}`.substring(0, 2000);
+    // Process raw OCR text through cleanup pipeline
+    const processed = OCRService.processOcrOutput(ocrResult.text);
+
+    // Build embedding text from cleaned output
+    const embeddingText = OCRService.summarizeForEmbedding(appName, windowTitle, processed);
 
     // Generate embedding
     const embedding = await this.embeddings.generateEmbedding(embeddingText);
     const embeddingValues = embedding.map(v => v.toString()).join(',');
 
-    // Build metadata
+    // Build metadata with extracted files, code snippets, and OCR stats
     const metadata = JSON.stringify({
       appName,
       windowTitle,
+      ...(url ? { url } : {}),
       ocrConfidence: ocrResult.confidence,
-      ocrLength: ocrResult.text.length,
+      ocrRawLength: ocrResult.text.length,
+      cleanedLength: processed.filteredText.length,
+      files: processed.files,
+      codeSnippets: processed.codeSnippets,
       capturedAt: new Date().toISOString()
     });
 
-    // Store the OCR text as source_text, embedding for search
+    // source_text = cleaned text for embedding/search
+    // extracted_text = filtered text (gibberish removed, redacted, no noise)
     const sql = `
       INSERT INTO memory (
         id, user_id, type, source_text, metadata,
@@ -190,7 +200,7 @@ class MonitorService {
         'screen_capture',
         '${embeddingText.replace(/'/g, '\'\'')}',
         '${metadata.replace(/'/g, '\'\'')}',
-        '${ocrResult.text.replace(/'/g, '\'\'')}',
+        '${processed.filteredText.replace(/'/g, '\'\'')}',
         list_value(${embeddingValues}),
         CURRENT_TIMESTAMP,
         CURRENT_TIMESTAMP
@@ -199,11 +209,16 @@ class MonitorService {
 
     await this.db.execute(sql);
 
-    // Store entities: app name and window title as searchable entities
+    // Store entities: app name, window title, and extracted file names
     const entities = [
       { type: 'application', value: appName, entity_type: 'APP' },
       { type: 'window', value: windowTitle.substring(0, 255), entity_type: 'WINDOW_TITLE' }
     ];
+
+    // Add extracted file names as entities for searchability
+    for (const file of processed.files.slice(0, 10)) {
+      entities.push({ type: 'file', value: file, entity_type: 'FILE' });
+    }
 
     for (const entity of entities) {
       const entityId = `ent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
