@@ -11,43 +11,6 @@ export function generateMemoryId() {
 }
 
 /**
- * Generate a random string
- */
-export function randomString(length = 8) {
-  return crypto.randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
-}
-
-/**
- * Calculate cosine similarity between two vectors
- */
-export function cosineSimilarity(vecA, vecB) {
-  if (!vecA || !vecB || vecA.length !== vecB.length) {
-    throw new Error('Invalid vectors for similarity calculation');
-  }
-
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-
-  for (let i = 0; i < vecA.length; i++) {
-    dotProduct += vecA[i] * vecB[i];
-    normA += vecA[i] * vecA[i];
-    normB += vecB[i] * vecB[i];
-  }
-
-  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
-  return denominator === 0 ? 0 : dotProduct / denominator;
-}
-
-/**
- * Sanitize SQL input (basic protection)
- */
-export function sanitizeSqlInput(input) {
-  if (typeof input !== 'string') return input;
-  return input.replace(/[;\-\-]/g, '');
-}
-
-/**
  * Validate memory text
  */
 export function validateMemoryText(text) {

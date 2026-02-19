@@ -66,14 +66,10 @@ class MemoryService {
       const embeddingValues = embedding.map(v => v.toString()).join(',');
       const sql = `
         INSERT INTO memory (
-          id, user_id, type, primary_intent, requires_memory_access,
-          suggested_response, source_text, metadata, screenshot, 
+          id, user_id, type, source_text, metadata, screenshot, 
           extracted_text, embedding, created_at, updated_at
         ) VALUES (
           '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
-          ${data.primary_intent ? `'${data.primary_intent}'` : 'NULL'},
-          ${data.requires_memory_access || false},
-          ${data.suggested_response ? `'${data.suggested_response.replace(/'/g, '\'\'')}'` : 'NULL'},
           '${text.replace(/'/g, '\'\'')}',
           '${metadataJson.replace(/'/g, '\'\'')}',
           ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
@@ -391,29 +387,12 @@ class MemoryService {
       
       const currentMemory = currentMemoryResult[0];
 
-      const updateFields = [];
       let regenerateEmbedding = false;
 
       if (updates.text) {
-        const text = validateMemoryText(updates.text);
-        updateFields.push(`source_text = '${text.replace(/'/g, '\'\'')}'`);
+        validateMemoryText(updates.text);
         regenerateEmbedding = true;
       }
-
-      if (updates.metadata) {
-        const metadataJson = JSON.stringify(updates.metadata);
-        updateFields.push(`metadata = '${metadataJson.replace(/'/g, '\'\'')}'`);
-      }
-
-      if (updates.screenshot !== undefined) {
-        updateFields.push(`screenshot = ${updates.screenshot ? `'${updates.screenshot}'` : 'NULL'}`);
-      }
-
-      if (updates.extractedText !== undefined) {
-        updateFields.push(`extracted_text = ${updates.extractedText ? `'${updates.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'}`);
-      }
-
-      updateFields.push('updated_at = CURRENT_TIMESTAMP');
 
       // Generate embedding first if needed
       let embedding = null;
@@ -452,7 +431,7 @@ class MemoryService {
           '${updates.metadata ? JSON.stringify(updates.metadata).replace(/'/g, '\'\'') : (currentMemory.metadata || '{}').replace(/'/g, '\'\'')}',
           ${updates.screenshot !== undefined ? (updates.screenshot ? `'${updates.screenshot}'` : 'NULL') : (currentMemory.screenshot ? `'${currentMemory.screenshot}'` : 'NULL')},
           ${updates.extractedText !== undefined ? (updates.extractedText ? `'${updates.extractedText.replace(/'/g, '\'\'')}'` : 'NULL') : (currentMemory.extracted_text ? `'${currentMemory.extracted_text.replace(/'/g, '\'\'')}'` : 'NULL')},
-          'user_memory',
+          '${currentMemory.type || 'user_memory'}',
           '${new Date(currentMemory.created_at).toISOString().slice(0, 19).replace('T', ' ')}',
           CURRENT_TIMESTAMP
         )
@@ -489,7 +468,7 @@ class MemoryService {
 
       logger.info('Memory updated successfully', {
         memoryId,
-        fieldsUpdated: updateFields.length,
+        regeneratedEmbedding: regenerateEmbedding,
         elapsedMs
       });
 

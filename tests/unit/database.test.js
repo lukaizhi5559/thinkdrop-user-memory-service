@@ -21,8 +21,8 @@ describe('DatabaseService', () => {
 
   test('should create tables on initialization', async () => {
     const tables = await db.query(`
-      SELECT name FROM sqlite_master 
-      WHERE type='table' AND name IN ('memory', 'memory_entities')
+      SELECT table_name as name FROM information_schema.tables 
+      WHERE table_schema = 'main' AND table_name IN ('memory', 'memory_entities')
     `);
     
     expect(tables.length).toBe(2);
@@ -69,8 +69,8 @@ describe('DatabaseService', () => {
 
   test('should create indexes', async () => {
     const indexes = await db.query(`
-      SELECT name FROM sqlite_master 
-      WHERE type='index' AND name LIKE 'idx_memory%'
+      SELECT index_name as name FROM duckdb_indexes()
+      WHERE table_name = 'memory' AND index_name LIKE 'idx_memory%'
     `);
 
     expect(indexes.length).toBeGreaterThan(0);

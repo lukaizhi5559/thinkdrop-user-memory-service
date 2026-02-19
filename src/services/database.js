@@ -76,20 +76,13 @@ class DatabaseService {
           id TEXT PRIMARY KEY,
           user_id TEXT,
           type TEXT DEFAULT 'user_memory',
-          primary_intent TEXT,
-          requires_memory_access BOOLEAN DEFAULT FALSE,
-          suggested_response TEXT,
           source_text TEXT,
           metadata TEXT,
           screenshot TEXT,
           extracted_text TEXT,
           embedding FLOAT[384],
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          synced_to_backend BOOLEAN DEFAULT FALSE,
-          backend_memory_id TEXT,
-          sync_attempts INTEGER DEFAULT 0,
-          last_sync_attempt TIMESTAMP
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
       logger.info('Memory table created');
@@ -98,7 +91,6 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_id ON memory(user_id)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory(created_at)');
-      await this.run('CREATE INDEX IF NOT EXISTS idx_memory_primary_intent ON memory(primary_intent)');
       
       // Create composite indexes for common query patterns
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory(user_id, created_at DESC)');

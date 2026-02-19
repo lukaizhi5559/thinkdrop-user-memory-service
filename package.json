@@ -12,7 +12,6 @@
     "test:load": "node tests/load/load-test.js",
     "db:init": "node scripts/init-db.js",
     "db:migrate": "node scripts/migrate-db.js",
-    "db:verify": "node scripts/verify-db.js",
     "lint": "eslint src/**/*.js",
     "format": "prettier --write src/**/*.js"
   },

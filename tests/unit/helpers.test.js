@@ -1,8 +1,6 @@
 import { describe, test, expect } from '@jest/globals';
 import {
   generateMemoryId,
-  randomString,
-  cosineSimilarity,
   validateMemoryText,
   parseMetadata,
   formatMCPResponse,
@@ -24,52 +22,6 @@ describe('Helper Functions', () => {
       const id2 = generateMemoryId();
       
       expect(id1).not.toBe(id2);
-    });
-  });
-
-  describe('randomString', () => {
-    test('should generate random string of specified length', () => {
-      const str = randomString(16);
-      
-      expect(str.length).toBe(16);
-      expect(str).toMatch(/^[a-f0-9]+$/);
-    });
-
-    test('should generate default 8-character string', () => {
-      const str = randomString();
-      
-      expect(str.length).toBe(8);
-    });
-  });
-
-  describe('cosineSimilarity', () => {
-    test('should calculate similarity between identical vectors', () => {
-      const vec = [1, 2, 3, 4, 5];
-      const similarity = cosineSimilarity(vec, vec);
-      
-      expect(similarity).toBeCloseTo(1.0, 5);
-    });
-
-    test('should calculate similarity between different vectors', () => {
-      const vec1 = [1, 0, 0];
-      const vec2 = [0, 1, 0];
-      const similarity = cosineSimilarity(vec1, vec2);
-      
-      expect(similarity).toBe(0);
-    });
-
-    test('should handle opposite vectors', () => {
-      const vec1 = [1, 1, 1];
-      const vec2 = [-1, -1, -1];
-      const similarity = cosineSimilarity(vec1, vec2);
-      
-      expect(similarity).toBeCloseTo(-1.0, 5);
-    });
-
-    test('should throw error for invalid vectors', () => {
-      expect(() => {
-        cosineSimilarity([1, 2], [1, 2, 3]);
-      }).toThrow();
     });
   });
 

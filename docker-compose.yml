@@ -21,9 +21,9 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - MIN_SIMILARITY_THRESHOLD=${MIN_SIMILARITY_THRESHOLD:-0.3}
-      - HIGH_SIMILARITY_THRESHOLD=${HIGH_SIMILARITY_THRESHOLD:-0.7}
       - EMBEDDING_CACHE_SIZE=${EMBEDDING_CACHE_SIZE:-1000}
-      - QUERY_CACHE_SIZE=${QUERY_CACHE_SIZE:-100}
+      - EMBEDDING_CACHE_TTL=${EMBEDDING_CACHE_TTL:-86400000}
+      - MAX_AGE_DAYS=${MAX_AGE_DAYS:-30}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001/service.health"]

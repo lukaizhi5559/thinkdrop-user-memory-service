@@ -72,11 +72,4 @@ export function getMetrics() {
   };
 }
 
-export function resetMetrics() {
-  metrics.requestCount = 0;
-  metrics.errorCount = 0;
-  metrics.totalResponseTime = 0;
-  metrics.requestsByAction = {};
-}
-
 export default metricsMiddleware;
