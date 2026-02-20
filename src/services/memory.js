@@ -152,7 +152,9 @@ class MemoryService {
       const limit = options.limit || 25;
       const offset = options.offset || 0;
       const minSimilarity = options.minSimilarity || parseFloat(process.env.MIN_SIMILARITY_THRESHOLD) || 0.3;
-      const maxAgeDays = options.maxAgeDays || parseInt(process.env.MAX_AGE_DAYS) || 30;
+      const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : (parseInt(process.env.MAX_AGE_DAYS) || 365);
+      const startDate = options.startDate || null;
+      const endDate = options.endDate || null;
 
       console.log('🔍 [MEMORY-SEARCH] Starting search...');
       console.log(`📝 [MEMORY-SEARCH] Query: "${query}"`);
@@ -175,12 +177,17 @@ class MemoryService {
         throw new Error(`Cannot search without query embedding: ${embeddingError.message}`);
       }
       
-      // Build WHERE clause with maxAge filter
+      // Build WHERE clause with date filters
       let whereConditions = [`user_id = '${userId}'`];
       
-      // Add maxAge filter to reduce search space
-      if (maxAgeDays > 0) {
+      // Explicit date range takes priority over maxAgeDays
+      if (startDate) {
+        whereConditions.push(`created_at >= '${startDate}'`);
+      } else if (maxAgeDays > 0) {
         whereConditions.push(`created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY`);
+      }
+      if (endDate) {
+        whereConditions.push(`created_at <= '${endDate}'`);
       }
       
       if (options.filters) {

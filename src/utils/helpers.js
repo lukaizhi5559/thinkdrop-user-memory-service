@@ -56,7 +56,7 @@ export function formatMCPResponse(action, requestId, status, data, error = null,
  * Extract user ID from context
  */
 export function extractUserId(context) {
-  return context?.userId || 'default_user';
+  return context?.userId || process.env.MONITOR_USER_ID || 'local_user';
 }
 
 /**
