@@ -21,6 +21,47 @@ const BROWSER_TAB_SCRIPTS = {
  * Falls back to browser-specific AppleScript for tab titles when Screen Recording
  * permission is not granted (get-windows returns empty title without it).
  */
+/**
+ * Pure AppleScript fallback for macOS — no native binary needed.
+ * Returns { appName, windowTitle }.
+ */
+function getActiveWindowAppleScript() {
+  const script = `
+    tell application "System Events"
+      set frontApp to name of first application process whose frontmost is true
+    end tell
+    set appTitle to ""
+    try
+      tell application frontApp
+        set appTitle to name of front window
+      end tell
+    end try
+    return frontApp & "|" & appTitle
+  `;
+  try {
+    const result = execSync(`osascript -e '${script.replace(/\n/g, ' ')}' 2>/dev/null`, {
+      timeout: 2000,
+      encoding: 'utf-8'
+    }).trim();
+    const [appName, windowTitle] = result.split('|');
+
+    // Try browser-specific tab title
+    const browserScript = BROWSER_TAB_SCRIPTS[appName?.trim()];
+    let title = windowTitle?.trim() || '';
+    if (!title && browserScript) {
+      try {
+        title = execSync(`osascript -e '${browserScript}' 2>/dev/null`, {
+          timeout: 1500, encoding: 'utf-8'
+        }).trim();
+      } catch (e) { /* ignore */ }
+    }
+
+    return { appName: appName?.trim() || 'unknown', windowTitle: title || 'unknown', url: null };
+  } catch (e) {
+    return { appName: 'unknown', windowTitle: 'unknown', url: null };
+  }
+}
+
 export async function getActiveWindow() {
   try {
     const win = await getActiveWin();
@@ -64,6 +105,10 @@ export async function getActiveWindow() {
       url
     };
   } catch (error) {
+    // get-windows binary failed — fall back to AppleScript on macOS
+    if (process.platform === 'darwin') {
+      return getActiveWindowAppleScript();
+    }
     logger.error('Failed to get active window', { error: error.message });
     return { appName: 'unknown', windowTitle: 'unknown', url: null };
   }

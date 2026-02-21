@@ -21,19 +21,40 @@ class DatabaseService {
       return;
     }
 
+    // Ensure data directory exists
+    const dir = path.dirname(this.dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      logger.info(`Created database directory: ${dir}`);
+    }
+
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY_MS = 3000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await this._tryConnect();
+        return;
+      } catch (err) {
+        const isLockError = err.message && err.message.includes('Could not set lock');
+        if (isLockError && attempt < MAX_RETRIES) {
+          logger.warn(`Database locked by another process (attempt ${attempt}/${MAX_RETRIES}). Retrying in ${RETRY_DELAY_MS / 1000}s...`, {
+            error: err.message.split('\n')[0]
+          });
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+        } else {
+          logger.error('Failed to initialize database after retries', { error: err.message });
+          throw err;
+        }
+      }
+    }
+  }
+
+  async _tryConnect() {
     return new Promise((resolve, reject) => {
       try {
-        // Ensure data directory exists
-        const dir = path.dirname(this.dbPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-          logger.info(`Created database directory: ${dir}`);
-        }
-
-        // Create database instance with callback
         this.db = new duckdb.Database(this.dbPath, async (err) => {
           if (err) {
-            logger.error('Failed to create database', { error: err.message });
             reject(err);
             return;
           }
@@ -56,12 +77,10 @@ class DatabaseService {
             logger.info(`Database initialized successfully: ${this.dbPath}`);
             resolve();
           } catch (error) {
-            logger.error('Failed to initialize database', { error: error.message });
             reject(error);
           }
         });
       } catch (error) {
-        logger.error('Failed to initialize database', { error: error.message });
         reject(error);
       }
     });

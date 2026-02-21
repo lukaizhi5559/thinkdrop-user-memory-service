@@ -19,6 +19,11 @@ class ScreenCaptureService {
       const buffer = await screenshot({ format: 'png' });
       return buffer;
     } catch (error) {
+      // Screen locked or no display available — skip silently
+      if (error.message && error.message.includes('No displays detected')) {
+        logger.debug('Screenshot skipped: no displays available (screen may be locked)');
+        return null;
+      }
       logger.error('Screenshot capture failed', { error: error.message });
       return null;
     }

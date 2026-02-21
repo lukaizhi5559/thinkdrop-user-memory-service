@@ -10,7 +10,7 @@ class MonitorService {
   constructor() {
     this.isRunning = false;
     this.intervalId = null;
-    this.captureInterval = parseInt(process.env.SCREEN_CAPTURE_INTERVAL || '10000', 10);
+    this.captureInterval = parseInt(process.env.SCREEN_CAPTURE_INTERVAL || '5000', 10);
     this.idleTimeout = parseInt(process.env.SCREEN_CAPTURE_IDLE_TIMEOUT || '300000', 10);
     this.lastAppName = null;
     this.lastWindowTitle = null;
@@ -95,6 +95,13 @@ class MonitorService {
 
       // Step 2: Get active window info
       const { appName, windowTitle, url } = await getActiveWindow();
+
+      // Skip if the active app is the ThinkDrop overlay itself
+      const SKIP_APPS = ['Electron', 'ThinkDrop'];
+      if (SKIP_APPS.some(skip => appName?.includes(skip))) {
+        this.skipCount++;
+        return;
+      }
 
       // Step 3: Check if window context changed
       const titleChanged = appName !== this.lastAppName || windowTitle !== this.lastWindowTitle;
