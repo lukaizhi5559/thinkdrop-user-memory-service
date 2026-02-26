@@ -28,6 +28,8 @@ import classifyRoute from './routes/classify.js';
 import debugRoute from './routes/debug.js';
 import healthRoute from './routes/health.js';
 import recentOcrRoute from './routes/recentOcr.js';
+import skillPromptRoute from './routes/skillPrompt.js';
+import skillRegistryRoute from './routes/skillRegistry.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -216,6 +218,8 @@ app.use(classifyRoute);
 app.use(debugRoute);
 app.use(healthRoute);
 app.use(recentOcrRoute);
+app.use(skillPromptRoute);
+app.use(skillRegistryRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);

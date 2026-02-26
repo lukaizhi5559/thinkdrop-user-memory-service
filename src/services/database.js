@@ -143,6 +143,42 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_entities_entity_type ON memory_entities(entity_type)');
       logger.info('Memory_entities table indexes created');
 
+      // Create skill_prompts table for RAG-based dynamic skill prompt injection
+      logger.info('Creating skill_prompts table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS skill_prompts (
+          id TEXT PRIMARY KEY,
+          tags TEXT,
+          prompt_text TEXT NOT NULL,
+          embedding FLOAT[384],
+          hit_count INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_skill_prompts_tags ON skill_prompts(tags)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_skill_prompts_created_at ON skill_prompts(created_at)');
+      logger.info('Skill_prompts table created');
+
+      // Create installed_skills table for the skill extension system
+      logger.info('Creating installed_skills table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS installed_skills (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT NOT NULL,
+          contract_md TEXT NOT NULL,
+          exec_path TEXT NOT NULL,
+          exec_type TEXT NOT NULL DEFAULT 'node',
+          enabled BOOLEAN DEFAULT true,
+          installed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_installed_skills_name ON installed_skills(name)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_installed_skills_enabled ON installed_skills(enabled)');
+      logger.info('Installed_skills table created');
+
       logger.info('Database tables created successfully');
     } catch (error) {
       logger.error('Failed to create tables', { error: error.message, stack: error.stack });
