@@ -160,6 +160,28 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_skill_prompts_created_at ON skill_prompts(created_at)');
       logger.info('Skill_prompts table created');
 
+      // Create context_rules table for per-site/app prompt injection
+      // context_type: 'site' (hostname) | 'app' (app name e.g. 'slack', 'excel')
+      // context_key:  hostname (e.g. 'en.wikipedia.org') OR app name (e.g. 'slack')
+      logger.info('Creating context_rules table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS context_rules (
+          id TEXT PRIMARY KEY,
+          context_type TEXT NOT NULL DEFAULT 'site',
+          context_key TEXT NOT NULL,
+          rule_text TEXT NOT NULL,
+          category TEXT DEFAULT 'general',
+          source TEXT DEFAULT 'thinkdrop_ai',
+          hit_count INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_context_rules_key ON context_rules(context_key)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_context_rules_type ON context_rules(context_type)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_context_rules_category ON context_rules(category)');
+      logger.info('Context_rules table created');
+
       // Create installed_skills table for the skill extension system
       logger.info('Creating installed_skills table...');
       await this.run(`
