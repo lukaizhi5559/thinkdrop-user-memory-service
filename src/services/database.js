@@ -182,6 +182,55 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_context_rules_category ON context_rules(category)');
       logger.info('Context_rules table created');
 
+      // Create api_rules table for per-service API contract rules used by skill generation pipeline
+      // service:   npm/API service name (e.g. 'clicksend', 'twilio', 'stripe', 'gmail')
+      // rule_type: 'auth' | 'payload' | 'secret' | 'endpoint' | 'gotcha'
+      // code_pattern: optional regex string to detect violations in generated skill code
+      // fix_hint:     exact correction to give the LLM when violation is found
+      // source:       'system' (seed rules) | 'learned' (written from runtime failures)
+      logger.info('Creating api_rules table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS api_rules (
+          id TEXT PRIMARY KEY,
+          service TEXT NOT NULL,
+          rule_type TEXT NOT NULL DEFAULT 'gotcha',
+          rule_text TEXT NOT NULL,
+          code_pattern TEXT,
+          fix_hint TEXT,
+          source TEXT DEFAULT 'system',
+          hit_count INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_service ON api_rules(service)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_type ON api_rules(rule_type)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_source ON api_rules(source)');
+      logger.info('Api_rules table created');
+      await this.seedApiRules();
+
+      // Create intent_overrides table for user-corrected intent learning.
+      // When the user corrects a wrong classification ("no, I meant go to the webpage"),
+      // we store the original phrase + correct intent here and check it before phi4
+      // on future prompts — so the same phrasing never misclassifies again.
+      logger.info('Creating intent_overrides table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS intent_overrides (
+          id TEXT PRIMARY KEY,
+          example_prompt TEXT NOT NULL,
+          correct_intent TEXT NOT NULL,
+          wrong_intent TEXT,
+          embedding FLOAT[384],
+          source TEXT DEFAULT 'user_correction',
+          hit_count INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_intent_overrides_intent ON intent_overrides(correct_intent)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_intent_overrides_created ON intent_overrides(created_at)');
+      logger.info('Intent_overrides table created');
+
       // Create installed_skills table for the skill extension system
       logger.info('Creating installed_skills table...');
       await this.run(`
@@ -206,6 +255,125 @@ class DatabaseService {
       logger.error('Failed to create tables', { error: error.message, stack: error.stack });
       throw error;
     }
+  }
+
+  /**
+   * Seed api_rules with known API contract rules on first boot (idempotent).
+   * Only inserts rules that don't already exist for a given service+rule_type+text combo.
+   */
+  async seedApiRules() {
+    const SQ = '\'';
+    const rules = [
+      // ── ClickSend ────────────────────────────────────────────────────────────
+      { service: 'clicksend', rule_type: 'auth',
+        rule_text: 'ClickSend Basic Auth MUST use both username AND API key: Buffer.from(secrets.CLICKSEND_USERNAME + ":" + secrets.CLICKSEND_API_KEY).toString("base64"). Empty username (":" + key) always returns 401 invalid_request.',
+        code_pattern: 'Buffer\\.from\\s*\\([`\'"]+:\\s*[`\'"]*\\$?\\{?\\s*\\w*(?:API_KEY|api_key)',
+        fix_hint: 'Replace Buffer.from(":" + key) with Buffer.from(secrets.CLICKSEND_USERNAME + ":" + secrets.CLICKSEND_API_KEY).toString("base64")' },
+      { service: 'clicksend', rule_type: 'secret',
+        rule_text: 'ClickSend requires TWO secrets: CLICKSEND_USERNAME (account email) AND CLICKSEND_API_KEY. Both must be in the Skill Interface secrets list.',
+        code_pattern: null,
+        fix_hint: 'Add CLICKSEND_USERNAME and CLICKSEND_API_KEY to secrets in plan.md Skill Interface.' },
+      { service: 'clicksend', rule_type: 'payload',
+        rule_text: 'ClickSend SMS POST /v3/sms/send requires: { messages: [{ to, body, source }] }. Flat { to, message } format returns invalid_request.',
+        code_pattern: '"to"\\s*:\\s*(?:secrets|RECIPIENT|phone)(?!.*messages\\s*:)',
+        fix_hint: 'Use: JSON.stringify({ messages: [{ to: secrets.RECIPIENT_PHONE_NUMBER, body: text, source: "thinkdrop" }] })' },
+      { service: 'clicksend', rule_type: 'endpoint',
+        rule_text: 'ClickSend SMS endpoint: POST https://rest.clicksend.com/v3/sms/send with Content-Type: application/json and Authorization: Basic <base64>.',
+        code_pattern: null,
+        fix_hint: 'hostname: "rest.clicksend.com", path: "/v3/sms/send", method: "POST"' },
+      { service: 'clicksend', rule_type: 'gotcha',
+        rule_text: 'npm package "clicksend" is TypeScript-only — require("clicksend") throws at runtime. Use Node.js built-in https to call the REST API directly.',
+        code_pattern: 'require\\s*\\([\'"]{1}clicksend[\'"]{1}\\)',
+        fix_hint: 'Remove require("clicksend"). Call https://rest.clicksend.com/v3/sms/send directly with https.request().' },
+      // ── Twilio ───────────────────────────────────────────────────────────────
+      { service: 'twilio', rule_type: 'auth',
+        rule_text: 'Twilio uses HTTP Basic Auth: Buffer.from(secrets.TWILIO_ACCOUNT_SID + ":" + secrets.TWILIO_AUTH_TOKEN).toString("base64"). SID is username, Auth Token is password.',
+        code_pattern: null,
+        fix_hint: '"Basic " + Buffer.from(secrets.TWILIO_ACCOUNT_SID + ":" + secrets.TWILIO_AUTH_TOKEN).toString("base64")' },
+      { service: 'twilio', rule_type: 'secret',
+        rule_text: 'Twilio requires: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER (sender). All three must be in the secrets list.',
+        code_pattern: null,
+        fix_hint: 'Declare TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER in secrets.' },
+      { service: 'twilio', rule_type: 'payload',
+        rule_text: 'Twilio SMS POST /2010-04-01/Accounts/{SID}/Messages.json requires Content-Type: application/x-www-form-urlencoded body with To, From, Body fields.',
+        code_pattern: null,
+        fix_hint: 'Use new URLSearchParams({ To, From, Body }).toString() with Content-Type: application/x-www-form-urlencoded.' },
+      // ── Gmail ────────────────────────────────────────────────────────────────
+      { service: 'gmail', rule_type: 'auth',
+        rule_text: 'Gmail API uses OAuth2. Required secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN. Use googleapis (ships compiled JS).',
+        code_pattern: null,
+        fix_hint: 'const { google } = require("googleapis"); const auth = new google.auth.OAuth2(clientId, secret, redirect); auth.setCredentials({ refresh_token });' },
+      { service: 'gmail', rule_type: 'secret',
+        rule_text: 'Gmail requires four OAuth secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN.',
+        code_pattern: null,
+        fix_hint: 'Add all four to secrets list.' },
+      { service: 'gmail', rule_type: 'gotcha',
+        rule_text: 'gmail-cli and mail-cli do not exist as real npm packages. Use the googleapis package for Gmail API access.',
+        code_pattern: 'gmail-cli|mail-cli|execSync.*gmail|spawn.*gmail',
+        fix_hint: 'Replace with: const { google } = require("googleapis").' },
+      // ── Stripe ───────────────────────────────────────────────────────────────
+      { service: 'stripe', rule_type: 'auth',
+        rule_text: 'Stripe uses Bearer auth: Authorization: "Bearer " + secrets.STRIPE_SECRET_KEY. The stripe npm package ships compiled CommonJS.',
+        code_pattern: null,
+        fix_hint: 'require("stripe")(secrets.STRIPE_SECRET_KEY) or https with Authorization: "Bearer " + secrets.STRIPE_SECRET_KEY' },
+      { service: 'stripe', rule_type: 'secret',
+        rule_text: 'Stripe requires STRIPE_SECRET_KEY (sk_live_... or sk_test_...). For webhooks also declare STRIPE_WEBHOOK_SECRET.',
+        code_pattern: null,
+        fix_hint: 'Declare STRIPE_SECRET_KEY in secrets.' },
+      // ── SendGrid ─────────────────────────────────────────────────────────────
+      { service: 'sendgrid', rule_type: 'auth',
+        rule_text: 'SendGrid uses Bearer auth: Authorization: "Bearer " + secrets.SENDGRID_API_KEY. Keys start with "SG.".',
+        code_pattern: null,
+        fix_hint: '{ "Authorization": "Bearer " + secrets.SENDGRID_API_KEY, "Content-Type": "application/json" }' },
+      { service: 'sendgrid', rule_type: 'payload',
+        rule_text: 'SendGrid POST /v3/mail/send payload: { personalizations:[{to:[{email}]}], from:{email}, subject, content:[{type:"text/plain",value}] }.',
+        code_pattern: null,
+        fix_hint: 'Payload: { personalizations:[{to:[{email:secrets.TO_EMAIL}]}], from:{email:secrets.FROM_EMAIL}, subject, content:[{type:"text/plain",value}] }' },
+      // ── Slack ────────────────────────────────────────────────────────────────
+      { service: 'slack', rule_type: 'auth',
+        rule_text: 'Slack Web API uses Bearer token: Authorization: "Bearer " + secrets.SLACK_BOT_TOKEN. @slack/web-api ships compiled CommonJS.',
+        code_pattern: null,
+        fix_hint: 'require("@slack/web-api") WebClient(secrets.SLACK_BOT_TOKEN) or https Authorization: "Bearer " + secrets.SLACK_BOT_TOKEN' },
+      { service: 'slack', rule_type: 'secret',
+        rule_text: 'Slack requires SLACK_BOT_TOKEN (xoxb-...) and SLACK_CHANNEL_ID for posting.',
+        code_pattern: null,
+        fix_hint: 'Declare SLACK_BOT_TOKEN and SLACK_CHANNEL_ID in secrets.' },
+      // ── GitHub ───────────────────────────────────────────────────────────────
+      { service: 'github', rule_type: 'auth',
+        rule_text: 'GitHub API: Authorization: "Bearer " + secrets.GITHUB_TOKEN. Personal tokens start with "ghp_", fine-grained with "github_pat_".',
+        code_pattern: null,
+        fix_hint: '{ "Authorization": "Bearer " + secrets.GITHUB_TOKEN, "Accept": "application/vnd.github.v3+json" }' },
+      // ── OpenAI ───────────────────────────────────────────────────────────────
+      { service: 'openai', rule_type: 'auth',
+        rule_text: 'OpenAI API: Authorization: "Bearer " + secrets.OPENAI_API_KEY. Keys start with "sk-".',
+        code_pattern: null,
+        fix_hint: '{ "Authorization": "Bearer " + secrets.OPENAI_API_KEY, "Content-Type": "application/json" }' },
+    ];
+
+    let seeded = 0;
+    for (const rule of rules) {
+      try {
+        const safeService  = rule.service.replace(/'/g, SQ + SQ);
+        const safeType     = rule.rule_type.replace(/'/g, SQ + SQ);
+        const safeText     = rule.rule_text.replace(/'/g, SQ + SQ);
+        const existing     = await this.all(
+          `SELECT id FROM api_rules WHERE service = '${safeService}' AND rule_type = '${safeType}' AND rule_text = '${safeText}'`
+        );
+        if (existing && existing.length > 0) continue;
+
+        const id          = `ar_seed_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        const patternVal  = rule.code_pattern ? `'${rule.code_pattern.replace(/'/g, SQ + SQ)}'` : 'NULL';
+        const fixHintVal  = rule.fix_hint     ? `'${rule.fix_hint.replace(/'/g, SQ + SQ)}'`     : 'NULL';
+        await this.run(`
+          INSERT INTO api_rules (id, service, rule_type, rule_text, code_pattern, fix_hint, source, hit_count, created_at, updated_at)
+          VALUES ('${id}','${safeService}','${safeType}','${safeText}',${patternVal},${fixHintVal},'system',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        `);
+        seeded++;
+      } catch (e) {
+        logger.warn(`[seedApiRules] Failed to seed ${rule.service}:${rule.rule_type}`, { error: e.message });
+      }
+    }
+    if (seeded > 0) logger.info(`[seedApiRules] Seeded ${seeded} api_rules`);
   }
 
   /**

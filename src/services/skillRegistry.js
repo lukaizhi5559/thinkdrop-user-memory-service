@@ -213,6 +213,62 @@ class SkillRegistryService {
   }
 
   /**
+   * Upsert a skill directly by fields — no contractMd required.
+   * Used by the installSkill node after the build pipeline writes the .cjs file.
+   * Returns { id, name, created: bool }.
+   */
+  async upsert({ name, description, execPath, execType = 'node', enabled = true, contractMd = '' }) {
+    if (!name || !execPath) throw new Error('upsert requires name and execPath');
+
+    const resolvedPath = execPath.startsWith('~/')
+      ? path.join(os.homedir(), execPath.slice(2))
+      : execPath;
+
+    if (!resolvedPath.startsWith(SKILLS_BASE_DIR)) {
+      throw new Error(`execPath ${execPath} is outside ${SKILLS_BASE_DIR}`);
+    }
+
+    const safe = (s) => String(s).replace(/'/g, SQ + SQ);
+    const existing = await this.db.query(
+      `SELECT id FROM installed_skills WHERE name = '${safe(name)}'`
+    );
+
+    if (existing.length > 0) {
+      const id = existing[0].id;
+      await this.db.execute(`
+        UPDATE installed_skills
+        SET description = '${safe(description || '')}',
+            exec_path   = '${safe(resolvedPath)}',
+            exec_type   = '${safe(execType)}',
+            contract_md = '${safe(contractMd || '')}',
+            enabled     = ${enabled ? 'true' : 'false'},
+            updated_at  = CURRENT_TIMESTAMP
+        WHERE id = '${id}'
+      `);
+      logger.info(`[SkillRegistry] Upserted (updated) skill: ${name}`);
+      return { id, name, created: false };
+    }
+
+    const id = generateId();
+    await this.db.execute(`
+      INSERT INTO installed_skills (id, name, description, contract_md, exec_path, exec_type, enabled, installed_at, updated_at)
+      VALUES (
+        '${id}',
+        '${safe(name)}',
+        '${safe(description || '')}',
+        '${safe(contractMd || '')}',
+        '${safe(resolvedPath)}',
+        '${safe(execType)}',
+        ${enabled ? 'true' : 'false'},
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+      )
+    `);
+    logger.info(`[SkillRegistry] Upserted (inserted) skill: ${name}`);
+    return { id, name, created: true };
+  }
+
+  /**
    * Enable or disable a skill by name.
    */
   async setEnabled(name, enabled) {

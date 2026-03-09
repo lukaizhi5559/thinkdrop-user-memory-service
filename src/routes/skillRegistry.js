@@ -121,4 +121,32 @@ router.post('/skill.setEnabled', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /skill.upsert
+ * Register or update a skill directly from fields (no contractMd).
+ * Used by the installSkill node after the build pipeline writes the .cjs file.
+ * Body: { payload: { name, description, execPath, execType, enabled? }, context, requestId }
+ */
+router.post('/skill.upsert', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+
+    if (!payload?.name || !payload?.execPath) {
+      return res.status(400).json({ error: 'Missing required fields: name, execPath' });
+    }
+
+    const result = await skillRegistryService.upsert({
+      name:        payload.name,
+      description: payload.description || '',
+      execPath:    payload.execPath,
+      execType:    payload.execType || 'node',
+      enabled:     payload.enabled !== false,
+      contractMd:  payload.contractMd || '',
+    });
+    res.json(formatMCPResponse('skill.upsert', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;

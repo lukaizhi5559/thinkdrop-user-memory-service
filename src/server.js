@@ -31,6 +31,8 @@ import recentOcrRoute from './routes/recentOcr.js';
 import skillPromptRoute from './routes/skillPrompt.js';
 import skillRegistryRoute from './routes/skillRegistry.js';
 import contextRuleRoute from './routes/contextRule.js';
+import apiRuleRoute from './routes/apiRule.js';
+import intentOverrideRoute from './routes/intentOverride.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -222,6 +224,8 @@ app.use(recentOcrRoute);
 app.use(skillPromptRoute);
 app.use(skillRegistryRoute);
 app.use(contextRuleRoute);
+app.use(apiRuleRoute);
+app.use(intentOverrideRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
