@@ -56,7 +56,7 @@ class SkillPromptService {
       // Bump hit_count for matched rows (fire-and-forget)
       for (const row of filtered) {
         this.db.execute(
-          `UPDATE skill_prompts SET hit_count = hit_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = '${row.id}'`
+          `UPDATE skill_prompts SET hit_count = hit_count + 1, updated_at = now() WHERE id = '${row.id}'`
         ).catch(() => {});
       }
 
@@ -111,7 +111,7 @@ class SkillPromptService {
           SET prompt_text = '${safeTextUpd}',
               tags = '${safeTagsUpd}',
               embedding = list_value(${embeddingValues}),
-              updated_at = CURRENT_TIMESTAMP
+              updated_at = now()
           WHERE id = '${existingId}'
         `);
         logger.debug(`[SkillPromptService] Updated existing snippet ${existingId} (similarity ${dupeCheck[0].similarity.toFixed(3)})`);
@@ -130,8 +130,8 @@ class SkillPromptService {
           '${safeTextIns}',
           list_value(${embeddingValues}),
           0,
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP
+          now(),
+          now()
         )
       `);
       logger.info(`[SkillPromptService] Inserted new snippet ${id} tags=[${tagsStr}]`);

@@ -55,7 +55,7 @@ class ContextRuleService {
       // Bump hit_count for matched rows (fire-and-forget)
       for (const row of rows) {
         this.db.execute(
-          `UPDATE context_rules SET hit_count = hit_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = '${row.id}'`
+          `UPDATE context_rules SET hit_count = hit_count + 1, updated_at = now() WHERE id = '${row.id}'`
         ).catch(() => {});
       }
 
@@ -122,8 +122,8 @@ class ContextRuleService {
           '${safeCategory}',
           '${safeSource}',
           0,
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP
+          now(),
+          now()
         )
       `);
       logger.info(`[ContextRuleService] Inserted rule ${id} for ${safeType}:${contextKey} category="${category}"`);

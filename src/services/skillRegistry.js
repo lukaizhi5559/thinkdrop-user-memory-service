@@ -71,6 +71,56 @@ function validateContract(contractMd) {
     );
   }
 
+  // Cross-field consistency: exec_type and exec_path must agree on skill type.
+  // Rule: exec_type:node → exec_path must be a .cjs/.js file (not .md)
+  //       exec_type:shell → exec_path must be a .md file (not .cjs/.js)
+  if (fm.exec_type === 'node' && resolvedPath.endsWith('.md')) {
+    throw new Error(
+      `Invalid skill contract: exec_type 'node' requires a .cjs exec_path, but got "${fm.exec_path}". ` +
+      `Contract/shell skills must use exec_type: shell.`
+    );
+  }
+  if ((resolvedPath.endsWith('.cjs') || resolvedPath.endsWith('.js')) && fm.exec_type !== 'node') {
+    throw new Error(
+      `Invalid skill contract: exec_path "${fm.exec_path}" (JS file) requires exec_type: node, but got "${fm.exec_type}".`
+    );
+  }
+
+  // ── Contract body quality checks ──────────────────────────────────────────
+  // These run after frontmatter validation so the body is always extracted
+  // from a known-valid contract structure.
+  const fmBlock = contractMd.match(/^---\s*\n[\s\S]*?\n---/);
+  const bodyText = fmBlock ? contractMd.slice(fmBlock[0].length) : contractMd;
+
+  // 1. Truncation guard: odd number of ``` fences means the LLM was cut off
+  //    mid-code-block (e.g. synthesize hit maxTokens mid-curl-command).
+  const fenceCount = (bodyText.match(/^```/mg) || []).length;
+  if (fenceCount % 2 !== 0) {
+    throw new Error(
+      `Skill contract appears truncated — odd number of code fences (${fenceCount}). ` +
+      `Increase synthesize maxTokens and regenerate the skill.`
+    );
+  }
+
+  // 2. Minimum body length — catches empty or near-empty generations.
+  if (bodyText.trim().length < 50) {
+    throw new Error(
+      `Skill contract body is too short (${bodyText.trim().length} chars). ` +
+      `The contract was likely truncated or failed to generate.`
+    );
+  }
+
+  // 3. Forbidden OAuth token-file pattern — prevents poisoned contractMd from
+  //    being stored and later injected as "CRITICAL RULES" into the planner.
+  if (/\.thinkdrop\/tokens\//.test(bodyText)) {
+    throw new Error(
+      `Skill contract contains a forbidden OAuth token file read pattern ` +
+      `(~/.thinkdrop/tokens/). Use the pre-injected $<PROVIDER>_ACCESS_TOKEN ` +
+      `env var instead. Fix the ## Auth section and reinstall.`
+    );
+  }
+  // ── End contract body quality checks ──────────────────────────────────────
+
   return {
     name: fm.name,
     description: fm.description,
@@ -110,10 +160,11 @@ class SkillRegistryService {
             exec_path    = '${safe(exec_path)}',
             exec_type    = '${safe(exec_type)}',
             enabled      = true,
-            updated_at   = CURRENT_TIMESTAMP
+            updated_at   = now()
         WHERE id = '${id}'
       `);
       logger.info(`[SkillRegistry] Updated skill: ${name} (${id})`);
+      await this._upsertHealth(name, 'ok', null);
       return { id, name, created: false };
     }
 
@@ -128,11 +179,12 @@ class SkillRegistryService {
         '${safe(exec_path)}',
         '${safe(exec_type)}',
         true,
-        CURRENT_TIMESTAMP,
-        CURRENT_TIMESTAMP
+        now(),
+        now()
       )
     `);
     logger.info(`[SkillRegistry] Installed new skill: ${name} (${id})`);
+    await this._upsertHealth(name, 'ok', null);
     return { id, name, created: true };
   }
 
@@ -147,6 +199,8 @@ class SkillRegistryService {
     if (existing.length === 0) {
       return { deleted: false, reason: `No skill named '${name}' is installed` };
     }
+    // Remove health record first (FK constraint)
+    await this.db.execute(`DELETE FROM skill_health WHERE skill_name = '${safe(name)}'`).catch(() => {});
     await this.db.execute(`DELETE FROM installed_skills WHERE name = '${safe(name)}'`);
     logger.info(`[SkillRegistry] Removed skill: ${name}`);
     return { deleted: true };
@@ -207,9 +261,9 @@ class SkillRegistryService {
    */
   async listNames() {
     const rows = await this.db.query(`
-      SELECT name, description FROM installed_skills WHERE enabled = true ORDER BY name ASC
+      SELECT name, description, exec_type, exec_path FROM installed_skills WHERE enabled = true ORDER BY name ASC
     `);
-    return rows.map(r => ({ name: r.name, description: r.description }));
+    return rows.map(r => ({ name: r.name, description: r.description, execType: r.exec_type, execPath: r.exec_path }));
   }
 
   /**
@@ -242,7 +296,7 @@ class SkillRegistryService {
             exec_type   = '${safe(execType)}',
             contract_md = '${safe(contractMd || '')}',
             enabled     = ${enabled ? 'true' : 'false'},
-            updated_at  = CURRENT_TIMESTAMP
+            updated_at  = now()
         WHERE id = '${id}'
       `);
       logger.info(`[SkillRegistry] Upserted (updated) skill: ${name}`);
@@ -260,8 +314,8 @@ class SkillRegistryService {
         '${safe(resolvedPath)}',
         '${safe(execType)}',
         ${enabled ? 'true' : 'false'},
-        CURRENT_TIMESTAMP,
-        CURRENT_TIMESTAMP
+        now(),
+        now()
       )
     `);
     logger.info(`[SkillRegistry] Upserted (inserted) skill: ${name}`);
@@ -275,10 +329,95 @@ class SkillRegistryService {
     const safe = (s) => s.replace(/'/g, SQ + SQ);
     await this.db.execute(`
       UPDATE installed_skills
-      SET enabled = ${enabled ? 'true' : 'false'}, updated_at = CURRENT_TIMESTAMP
+      SET enabled = ${enabled ? 'true' : 'false'}, updated_at = now()
       WHERE name = '${safe(name)}'
     `);
     return { name, enabled };
+  }
+
+  // ── skill_health helpers ───────────────────────────────────────────────────
+
+  /**
+   * Internal helper — upsert a health record. status is 'ok'|'invalid'|'repaired'|'unvalidated'.
+   */
+  async _upsertHealth(skillName, status, errors, autoRepaired = false) {
+    const safe = (s) => String(s || '').replace(/'/g, SQ + SQ);
+    const errText = errors ? safe(typeof errors === 'object' ? JSON.stringify(errors) : String(errors)) : '';
+    try {
+      await this.db.execute(`
+        INSERT INTO skill_health (skill_name, status, errors, last_checked_at, auto_repaired)
+        VALUES ('${safe(skillName)}', '${safe(status)}', '${errText}', now(), ${autoRepaired})
+        ON CONFLICT (skill_name) DO UPDATE SET
+          status = '${safe(status)}',
+          errors = '${errText}',
+          last_checked_at = now(),
+          auto_repaired = ${autoRepaired}
+      `);
+    } catch (e) {
+      // Graceful fallback if ON CONFLICT syntax varies
+      await this.db.execute(`DELETE FROM skill_health WHERE skill_name = '${safe(skillName)}'`).catch(() => {});
+      await this.db.execute(`
+        INSERT INTO skill_health (skill_name, status, errors, last_checked_at, auto_repaired)
+        VALUES ('${safe(skillName)}', '${safe(status)}', '${errText}', now(), ${autoRepaired})
+      `);
+    }
+  }
+
+  /**
+   * Upsert a health record for a skill (called by skill.review agent).
+   */
+  async healthUpsert({ skillName, status, errors, autoRepaired = false }) {
+    if (!skillName || !status) throw new Error('healthUpsert requires skillName and status');
+    await this._upsertHealth(skillName, status, errors, autoRepaired);
+    return { skillName, status };
+  }
+
+  /**
+   * Get health record for a single skill.
+   */
+  async healthGet(skillName) {
+    const safe = (s) => String(s).replace(/'/g, SQ + SQ);
+    const rows = await this.db.query(
+      `SELECT * FROM skill_health WHERE skill_name = '${safe(skillName)}' LIMIT 1`
+    );
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      skillName: r.skill_name,
+      status: r.status,
+      errors: r.errors || null,
+      lastCheckedAt: r.last_checked_at,
+      autoRepaired: Boolean(r.auto_repaired)
+    };
+  }
+
+  /**
+   * List skills with non-'ok' health status (the unhealthy set).
+   * Pass { all: true } to return all health records.
+   */
+  async healthList({ all = false } = {}) {
+    const where = all ? '' : `WHERE h.status != 'ok'`;
+    const rows = await this.db.query(`
+      SELECT h.skill_name, h.status, h.errors, h.last_checked_at, h.auto_repaired,
+             s.exec_type, s.exec_path, s.enabled
+      FROM skill_health h
+      LEFT JOIN installed_skills s ON s.name = h.skill_name
+      ${where}
+      ORDER BY h.last_checked_at DESC
+    `);
+    return {
+      results: rows.map(r => ({
+        skillName: r.skill_name,
+        status: r.status,
+        errors: r.errors || null,
+        lastCheckedAt: r.last_checked_at,
+        autoRepaired: Boolean(r.auto_repaired),
+        execType: r.exec_type,
+        execPath: r.exec_path,
+        enabled: Boolean(r.enabled)
+      })),
+      total: rows.length
+    };
   }
 }
 

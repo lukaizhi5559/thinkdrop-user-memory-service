@@ -87,13 +87,13 @@ class MonitorService {
    */
   async tick() {
     try {
-      // Step 1: Check if system is idle
-      if (isSystemIdle(this.idleTimeout)) {
+      // Step 1: Cheap idle check (ioreg) — skip everything if user is idle
+      if (await isSystemIdle(this.idleTimeout)) {
         this.skipCount++;
         return;
       }
 
-      // Step 2: Get active window info
+      // Step 2: Get active window — cheap on same-app ticks via cached result
       const { appName, windowTitle, url } = await getActiveWindow();
 
       // Skip if the active app is the ThinkDrop overlay itself
@@ -111,18 +111,20 @@ class MonitorService {
       let screenshotBuffer;
 
       if (titleChanged) {
-        // Window changed — always capture
+        // Window/app changed — take screenshot and update pixel diff baseline
         screenshotBuffer = await this.screenCapture.capture();
         if (!screenshotBuffer) {
           this.skipCount++;
           return;
         }
-        // Update the diff baseline
+        // Update diff baseline for next same-window tick
         await this.screenCapture.computeDiff(screenshotBuffer);
       } else {
-        // Step 4: Same window — check pixel diff
+        // Step 4: Same window — take screenshot and run pixel diff
+        // Only proceed to OCR+embedding if content visually changed
         const { changed, diffRatio, buffer } = await this.screenCapture.captureIfChanged();
         if (!changed) {
+          // Screen unchanged — skip OCR and embedding entirely
           this.skipCount++;
           return;
         }
@@ -209,8 +211,8 @@ class MonitorService {
         '${metadata.replace(/'/g, '\'\'')}',
         '${processed.filteredText.replace(/'/g, '\'\'')}',
         list_value(${embeddingValues}),
-        CURRENT_TIMESTAMP,
-        CURRENT_TIMESTAMP
+        now(),
+        now()
       )
     `;
 

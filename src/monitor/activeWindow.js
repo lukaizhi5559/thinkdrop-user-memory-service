@@ -1,6 +1,17 @@
 import { activeWindow as getActiveWin } from 'get-windows';
-import { execSync } from 'child_process';
+import { execSync, exec } from 'child_process';
+import { promisify } from 'util';
 import logger from '../utils/logger.js';
+
+const execAsync = promisify(exec);
+
+// Cache idle state — ioreg is expensive, only re-run every 4s
+let _idleCache = { idle: false, ts: 0 };
+const IDLE_CACHE_TTL = 4000;
+
+// Cache active window — osascript is expensive, only re-run every 2s
+let _windowCache = { result: null, ts: 0 };
+const WINDOW_CACHE_TTL = 2000;
 
 // Browser-specific AppleScript to get active tab title (no Screen Recording needed)
 const BROWSER_TAB_SCRIPTS = {
@@ -25,7 +36,7 @@ const BROWSER_TAB_SCRIPTS = {
  * Pure AppleScript fallback for macOS — no native binary needed.
  * Returns { appName, windowTitle }.
  */
-function getActiveWindowAppleScript() {
+async function getActiveWindowAppleScript() {
   const script = `
     tell application "System Events"
       set frontApp to name of first application process whose frontmost is true
@@ -39,10 +50,10 @@ function getActiveWindowAppleScript() {
     return frontApp & "|" & appTitle
   `;
   try {
-    const result = execSync(`osascript -e '${script.replace(/\n/g, ' ')}' 2>/dev/null`, {
-      timeout: 2000,
-      encoding: 'utf-8'
-    }).trim();
+    const { stdout: raw } = await execAsync(`osascript -e '${script.replace(/\n/g, ' ')}' 2>/dev/null`, {
+      timeout: 2000
+    });
+    const result = raw.trim();
     const [appName, windowTitle] = result.split('|');
 
     // Try browser-specific tab title
@@ -50,9 +61,8 @@ function getActiveWindowAppleScript() {
     let title = windowTitle?.trim() || '';
     if (!title && browserScript) {
       try {
-        title = execSync(`osascript -e '${browserScript}' 2>/dev/null`, {
-          timeout: 1500, encoding: 'utf-8'
-        }).trim();
+        const { stdout } = await execAsync(`osascript -e '${browserScript}' 2>/dev/null`, { timeout: 1500 });
+        title = stdout.trim();
       } catch (e) { /* ignore */ }
     }
 
@@ -63,6 +73,10 @@ function getActiveWindowAppleScript() {
 }
 
 export async function getActiveWindow() {
+  const now = Date.now();
+  if (_windowCache.result && now - _windowCache.ts < WINDOW_CACHE_TTL) {
+    return _windowCache.result;
+  }
   try {
     const win = await getActiveWin();
 
@@ -75,15 +89,13 @@ export async function getActiveWindow() {
     const url = win.url || null;
 
     // If title is empty (Screen Recording permission not granted),
-    // try browser-specific AppleScript as fallback
+    // try browser-specific AppleScript as fallback (async — non-blocking)
     if (!windowTitle && process.platform === 'darwin') {
       const browserScript = BROWSER_TAB_SCRIPTS[appName];
       if (browserScript) {
         try {
-          windowTitle = execSync(
-            `osascript -e '${browserScript}' 2>/dev/null`,
-            { timeout: 1500, encoding: 'utf-8' }
-          ).trim();
+          const { stdout } = await execAsync(`osascript -e '${browserScript}' 2>/dev/null`, { timeout: 1500 });
+          windowTitle = stdout.trim();
         } catch (e) {
           // AppleScript failed — use URL domain as last resort
         }
@@ -99,15 +111,15 @@ export async function getActiveWindow() {
       }
     }
 
-    return {
-      appName,
-      windowTitle: windowTitle || 'unknown',
-      url
-    };
+    const result = { appName, windowTitle: windowTitle || 'unknown', url };
+    _windowCache = { result, ts: Date.now() };
+    return result;
   } catch (error) {
     // get-windows binary failed — fall back to AppleScript on macOS
     if (process.platform === 'darwin') {
-      return getActiveWindowAppleScript();
+      const result = await getActiveWindowAppleScript();
+      _windowCache = { result, ts: Date.now() };
+      return result;
     }
     logger.error('Failed to get active window', { error: error.message });
     return { appName: 'unknown', windowTitle: 'unknown', url: null };
@@ -116,19 +128,24 @@ export async function getActiveWindow() {
 
 /**
  * Check if the system is idle (screen locked or no recent input).
- * Mac only for now — uses HIDIdleTime.
+ * Async — uses ioreg via exec (non-blocking). Cached for IDLE_CACHE_TTL ms.
  */
-export function isSystemIdle(idleThresholdMs = 300000) {
+export async function isSystemIdle(idleThresholdMs = 300000) {
+  const now = Date.now();
+  if (now - _idleCache.ts < IDLE_CACHE_TTL) {
+    return _idleCache.idle;
+  }
   try {
     if (process.platform === 'darwin') {
-      const idleTime = execSync(
+      const { stdout } = await execAsync(
         'ioreg -c IOHIDSystem | awk \'/HIDIdleTime/ {print $NF; exit}\'',
-        { timeout: 2000, encoding: 'utf-8' }
-      ).trim();
-      const idleMs = parseInt(idleTime, 10) / 1000000; // nanoseconds to ms
-      return idleMs > idleThresholdMs;
+        { timeout: 2000 }
+      );
+      const idleMs = parseInt(stdout.trim(), 10) / 1000000;
+      const idle = idleMs > idleThresholdMs;
+      _idleCache = { idle, ts: now };
+      return idle;
     }
-    // Windows: could use GetLastInputInfo, but skip for now
     return false;
   } catch (error) {
     logger.error('Failed to check idle state', { error: error.message });

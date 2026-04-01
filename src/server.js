@@ -33,6 +33,11 @@ import skillRegistryRoute from './routes/skillRegistry.js';
 import contextRuleRoute from './routes/contextRule.js';
 import apiRuleRoute from './routes/apiRule.js';
 import intentOverrideRoute from './routes/intentOverride.js';
+import phrasePreferenceRoute from './routes/phrasePreference.js';
+import personalityRoute from './routes/personality.js';
+import fingerprintRoute from './routes/fingerprint.js';
+import userProfileRoute from './routes/userProfile.js';
+import userConstraintsRoute from './routes/userConstraints.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -226,6 +231,11 @@ app.use(skillRegistryRoute);
 app.use(contextRuleRoute);
 app.use(apiRuleRoute);
 app.use(intentOverrideRoute);
+app.use(phrasePreferenceRoute);
+app.use(personalityRoute);
+app.use(fingerprintRoute);
+app.use(userProfileRoute);
+app.use(userConstraintsRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
@@ -274,6 +284,12 @@ async function startServer() {
       console.log('   - POST /memory.list');
       console.log('   - POST /memory.classify-conversational-query');
       console.log('   - POST /memory.getRecentOcr');
+      console.log('   - POST /personality.getState');
+      console.log('   - POST /personality.event');
+      console.log('   - POST /personality.resetState');
+      console.log('   - POST /personality.getTraits');
+      console.log('   - POST /personality.upsertTrait');
+      console.log('   - POST /personality.getOverlay');
       if (process.env.MONITOR_SCREEN_OCR === 'true') {
         console.log('\n👁️  Screen Monitor: ACTIVE');
         console.log(`   Capture interval: ${process.env.SCREEN_CAPTURE_INTERVAL || 10000}ms`);

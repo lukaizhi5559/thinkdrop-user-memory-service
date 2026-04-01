@@ -62,7 +62,7 @@ class IntentOverrideService {
 
       // Bump hit_count (fire-and-forget)
       this.db.execute(
-        `UPDATE intent_overrides SET hit_count = hit_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = '${top.id}'`
+        `UPDATE intent_overrides SET hit_count = hit_count + 1, updated_at = now() WHERE id = '${top.id}'`
       ).catch(() => {});
 
       logger.info(`[IntentOverrideService] Match: "${top.example_prompt.slice(0, 60)}" → ${top.correct_intent} (sim=${sim.toFixed(3)})`);
@@ -88,7 +88,12 @@ class IntentOverrideService {
 
     if (!examplePrompt || !correctIntent) throw new Error('examplePrompt and correctIntent are required');
 
-    const validIntents = ['command_automate', 'memory_retrieve', 'web_search', 'screen_intelligence', 'memory_store', 'general_query'];
+    const validIntents = [
+      'command_automate', 'memory_retrieve', 'web_search', 'screen_intelligence',
+      'memory_store', 'general_query',
+      // Extended: additional intents used by parseIntent overrides
+      'set_constraint', 'app_control_start', 'general_knowledge'
+    ];
     if (!validIntents.includes(correctIntent)) throw new Error(`Invalid intent: ${correctIntent}`);
 
     try {
@@ -119,8 +124,8 @@ class IntentOverrideService {
           ${embeddingStr}::FLOAT[384],
           '${safeSource}',
           0,
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP
+          now(),
+          now()
         )
       `);
 

@@ -75,8 +75,8 @@ class MemoryService {
           ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
           ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
           list_value(${embeddingValues}),
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP
+          now(),
+          now()
         )
       `;
 
@@ -442,7 +442,7 @@ class MemoryService {
           ${updates.extractedText !== undefined ? (updates.extractedText ? `'${updates.extractedText.replace(/'/g, '\'\'')}'` : 'NULL') : (currentMemory.extracted_text ? `'${currentMemory.extracted_text.replace(/'/g, '\'\'')}'` : 'NULL')},
           '${currentMemory.type || 'user_memory'}',
           '${new Date(currentMemory.created_at).toISOString().slice(0, 19).replace('T', ' ')}',
-          CURRENT_TIMESTAMP
+          now()
         )
       `;
       

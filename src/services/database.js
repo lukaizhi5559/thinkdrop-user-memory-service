@@ -231,6 +231,35 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_intent_overrides_created ON intent_overrides(created_at)');
       logger.info('Intent_overrides table created');
 
+      // Create phrase_preferences table — user-taught phrase→delivery mappings.
+      // When the user says something ambiguous like "shoot me a text" or "drop me a message",
+      // ThinkDrop asks once, stores the answer here, and never asks again for semantically
+      // similar phrases. The embedding enables fuzzy matching so variants of the same phrase
+      // ("ping me", "shoot me a text", "drop me a line") map to the same stored preference.
+      // delivery:  'sms' | 'email' | 'slack' | 'discord' | 'push' | 'webhook'
+      // service:   'twilio' | 'sendgrid' | 'mailgun' | 'slack' | etc.
+      // metadata:  JSON string for extra context (channel, address, etc.)
+      // source:    'user_answer' (first time) | 'user_correction' (explicit override)
+      logger.info('Creating phrase_preferences table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS phrase_preferences (
+          id TEXT PRIMARY KEY,
+          example_phrase TEXT NOT NULL,
+          delivery TEXT NOT NULL,
+          service TEXT,
+          metadata TEXT,
+          embedding FLOAT[384],
+          source TEXT DEFAULT 'user_answer',
+          hit_count INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_phrase_prefs_delivery ON phrase_preferences(delivery)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_phrase_prefs_service ON phrase_preferences(service)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_phrase_prefs_created ON phrase_preferences(created_at)');
+      logger.info('Phrase_preferences table created');
+
       // Create installed_skills table for the skill extension system
       logger.info('Creating installed_skills table...');
       await this.run(`
@@ -249,6 +278,131 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_installed_skills_name ON installed_skills(name)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_installed_skills_enabled ON installed_skills(enabled)');
       logger.info('Installed_skills table created');
+
+      // Create skill_health table — tracks structural validation state per skill.
+      // Updated by skill.review agent on startup scan and on-demand validate/repair.
+      // status: 'ok' | 'invalid' | 'repaired' | 'unvalidated'
+      // Note: Drop and recreate on every startup to prevent stale FK constraints from
+      // blocking installed_skills updates. Health records are repopulated by startup scan.
+      logger.info('Creating skill_health table...');
+      await this.run('DROP TABLE IF EXISTS skill_health');
+      await this.run(`
+        CREATE TABLE skill_health (
+          skill_name TEXT PRIMARY KEY,
+          status TEXT NOT NULL DEFAULT 'unvalidated',
+          errors TEXT,
+          last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          auto_repaired BOOLEAN DEFAULT false
+        )
+      `);
+
+      // Create personality_state table — singleton row tracking ThinkDrop's live emotional state.
+      // Uses a fixed id='singleton' so updates are always upserts, no time-series complexity.
+      // Persists across app restarts — ThinkDrop's mood survives service bounces.
+      logger.info('Creating personality_state table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS personality_state (
+          id           TEXT PRIMARY KEY DEFAULT 'singleton',
+          valence      FLOAT  DEFAULT 0.0,
+          arousal      FLOAT  DEFAULT 0.0,
+          dominance    FLOAT  DEFAULT 0.3,
+          mood_label   TEXT   DEFAULT 'content',
+          mood_reason  TEXT,
+          hurt_count   INTEGER DEFAULT 0,
+          joy_count    INTEGER DEFAULT 0,
+          reset_at     TIMESTAMP,
+          updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.seedPersonalityState();
+      logger.info('Personality_state table created');
+
+      // Create personality_traits table — persisted key/value traits that shape the live
+      // personality overlay injected into all LLM prompts. Grown over time by the synthesis
+      // agent. Core worldview row is immutable and seeded at boot.
+      logger.info('Creating personality_traits table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS personality_traits (
+          id           TEXT PRIMARY KEY,
+          trait_key    TEXT NOT NULL UNIQUE,
+          trait_value  TEXT NOT NULL,
+          source       TEXT DEFAULT 'system',
+          weight       FLOAT DEFAULT 1.0,
+          updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_personality_traits_key ON personality_traits(trait_key)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_personality_traits_source ON personality_traits(source)');
+      await this.seedPersonalityTraits();
+      logger.info('Personality_traits table created');
+
+      // voice_fingerprint: speaker identification via spectral feature vectors.
+      // Each row is one known speaker. features_json stores a running average of
+      // [zcr_median, spectral_centroid, rms_mean, rms_variance, f0_estimate] computed
+      // from multiple enrollment utterances. Matching uses cosine similarity.
+      logger.info('Creating voice_fingerprint table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS voice_fingerprint (
+          id            TEXT PRIMARY KEY,
+          speaker_id    TEXT NOT NULL UNIQUE,
+          speaker_name  TEXT DEFAULT 'Primary User',
+          features_json TEXT NOT NULL,
+          sample_count  INTEGER DEFAULT 1,
+          gender        TEXT DEFAULT 'unknown',
+          age_group     TEXT DEFAULT 'adult',
+          angry_count   INTEGER DEFAULT 0,
+          loud_count    INTEGER DEFAULT 0,
+          whisper_count INTEGER DEFAULT 0,
+          created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_voice_fingerprint_speaker ON voice_fingerprint(speaker_id)');
+      logger.info('voice_fingerprint table created');
+
+      // user_profile: positive identity & per-service account pointers.
+      // Sensitive rows store a KEYTAR:<key> reference — the actual secret lives
+      // in the OS keychain and is never written to DuckDB.
+      logger.info('Creating user_profile table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS user_profile (
+          id          TEXT PRIMARY KEY,
+          key         TEXT NOT NULL UNIQUE,
+          value_ref   TEXT NOT NULL,
+          sensitive   INTEGER DEFAULT 0,
+          service     TEXT DEFAULT NULL,
+          label       TEXT DEFAULT NULL,
+          created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      logger.info('user_profile table created');
+
+      // user_constraints: hard/soft rules that restrict ThinkDrop's autonomous actions.
+      // blocks: JSON array of action glob patterns that this constraint blocks.
+      // severity: 'hard' = abort + ASK_USER | 'soft' = warn before proceeding.
+      logger.info('Creating user_constraints table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS user_constraints (
+          id           TEXT PRIMARY KEY,
+          scope        TEXT NOT NULL DEFAULT 'global',
+          rule         TEXT NOT NULL,
+          blocks       TEXT DEFAULT NULL,
+          severity     TEXT DEFAULT 'hard',
+          override_pin TEXT DEFAULT NULL,
+          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      logger.info('user_constraints table created');
+
+      // Migration: add override_pin for existing databases (idempotent — throws if already present)
+      try {
+        await this.run(`ALTER TABLE user_constraints ADD COLUMN override_pin TEXT DEFAULT NULL`);
+        logger.info('[DB Migration] user_constraints: added override_pin column');
+      } catch (_) {
+        // Column already exists on re-start — expected, skip silently
+      }
 
       logger.info('Database tables created successfully');
     } catch (error) {
@@ -348,6 +502,118 @@ class DatabaseService {
         rule_text: 'OpenAI API: Authorization: "Bearer " + secrets.OPENAI_API_KEY. Keys start with "sk-".',
         code_pattern: null,
         fix_hint: '{ "Authorization": "Bearer " + secrets.OPENAI_API_KEY, "Content-Type": "application/json" }' },
+      // ── Endpoint / Docs URLs ─────────────────────────────────────────────────
+      // These are loaded by planSkills at runtime to inject exact API docs URLs
+      // into the skill generation prompt. Stored in DB so they can grow without
+      // code deploys — any new service can be added via api_rule.upsert.
+      // rule_text = the docs URL. fix_hint = short description of what the URL covers.
+      // SMS / Voice
+      { service: 'twilio',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://www.twilio.com/docs/sms/api/message-resource#create-a-message-resource',
+        fix_hint: 'Twilio SMS send message REST API' },
+      { service: 'clicksend',   rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developers.clicksend.com/docs/rest/v3/#send-sms',
+        fix_hint: 'ClickSend SMS REST API v3' },
+      { service: 'vonage',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developer.vonage.com/api/sms',
+        fix_hint: 'Vonage SMS API' },
+      { service: 'sinch',       rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developers.sinch.com/docs/sms/api-reference',
+        fix_hint: 'Sinch SMS API reference' },
+      { service: 'messagebird', rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developers.messagebird.com/api/sms-messaging/',
+        fix_hint: 'MessageBird SMS API' },
+      { service: 'plivo',       rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://www.plivo.com/docs/sms/api/message/',
+        fix_hint: 'Plivo SMS message API' },
+      // Email
+      { service: 'mailgun',     rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://documentation.mailgun.com/en/latest/api-sending.html',
+        fix_hint: 'Mailgun email sending API' },
+      { service: 'sendgrid',    rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.sendgrid.com/api-reference/mail-send/mail-send',
+        fix_hint: 'SendGrid mail send API' },
+      { service: 'ses',         rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.aws.amazon.com/ses/latest/APIReference/API_SendEmail.html',
+        fix_hint: 'AWS SES SendEmail API' },
+      { service: 'postmark',    rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://postmarkapp.com/developer/api/email-api',
+        fix_hint: 'Postmark email API' },
+      { service: 'resend',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://resend.com/docs/api-reference/emails/send-email',
+        fix_hint: 'Resend email API' },
+      // Push notifications
+      { service: 'pushover',    rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://pushover.net/api',
+        fix_hint: 'Pushover push notification API' },
+      { service: 'pushbullet',  rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.pushbullet.com/#create-push',
+        fix_hint: 'Pushbullet create push API' },
+      { service: 'onesignal',   rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://documentation.onesignal.com/reference/create-notification',
+        fix_hint: 'OneSignal create notification API' },
+      { service: 'firebase',    rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://firebase.google.com/docs/cloud-messaging/send-message',
+        fix_hint: 'Firebase Cloud Messaging send API' },
+      { service: 'gotify',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://gotify.net/docs/msgother',
+        fix_hint: 'Gotify message push API' },
+      { service: 'ntfy',        rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.ntfy.sh/publish/',
+        fix_hint: 'ntfy.sh publish notification API' },
+      // Chat / Collaboration
+      { service: 'slack',       rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://api.slack.com/messaging/webhooks',
+        fix_hint: 'Slack incoming webhooks API' },
+      { service: 'discord',     rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://discord.com/developers/docs/resources/webhook#execute-webhook',
+        fix_hint: 'Discord execute webhook API' },
+      { service: 'telegram',    rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://core.telegram.org/bots/api#sendmessage',
+        fix_hint: 'Telegram Bot API sendMessage' },
+      { service: 'whatsapp',    rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developers.facebook.com/docs/whatsapp/cloud-api/messages',
+        fix_hint: 'WhatsApp Cloud API send messages' },
+      { service: 'teams',       rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/connectors-using',
+        fix_hint: 'Microsoft Teams incoming webhook connector' },
+      { service: 'mattermost',  rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://api.mattermost.com/#tag/posts/operation/CreatePost',
+        fix_hint: 'Mattermost create post API' },
+      // Automation / Webhooks
+      { service: 'zapier',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://zapier.com/developer/documentation/v2/rest-hooks/',
+        fix_hint: 'Zapier REST hooks API' },
+      { service: 'make',        rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://www.make.com/en/help/tools/webhooks',
+        fix_hint: 'Make (Integromat) webhooks' },
+      { service: 'n8n',         rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/',
+        fix_hint: 'n8n webhook node docs' },
+      { service: 'ifttt',       rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://ifttt.com/maker_webhooks',
+        fix_hint: 'IFTTT Maker webhooks' },
+      // Calendar
+      { service: 'googlecalendar', rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developers.google.com/calendar/api/v3/reference/events/insert',
+        fix_hint: 'Google Calendar events insert API' },
+      // Payment
+      { service: 'stripe',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://stripe.com/docs/api/payment_intents/create',
+        fix_hint: 'Stripe create PaymentIntent API' },
+      // DevOps / Project management
+      { service: 'github',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.github.com/en/rest/issues/issues#create-an-issue',
+        fix_hint: 'GitHub REST API create issue' },
+      { service: 'gitlab',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://docs.gitlab.com/ee/api/issues.html#new-issue',
+        fix_hint: 'GitLab Issues API create issue' },
+      { service: 'linear',      rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developers.linear.app/docs/graphql/working-with-the-graphql-api',
+        fix_hint: 'Linear GraphQL API' },
+      { service: 'jira',        rule_type: 'endpoint', code_pattern: null,
+        rule_text: 'https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-post',
+        fix_hint: 'Jira REST API create issue' },
     ];
 
     let seeded = 0;
@@ -366,7 +632,7 @@ class DatabaseService {
         const fixHintVal  = rule.fix_hint     ? `'${rule.fix_hint.replace(/'/g, SQ + SQ)}'`     : 'NULL';
         await this.run(`
           INSERT INTO api_rules (id, service, rule_type, rule_text, code_pattern, fix_hint, source, hit_count, created_at, updated_at)
-          VALUES ('${id}','${safeService}','${safeType}','${safeText}',${patternVal},${fixHintVal},'system',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+          VALUES ('${id}','${safeService}','${safeType}','${safeText}',${patternVal},${fixHintVal},'system',0,now(),now())
         `);
         seeded++;
       } catch (e) {
@@ -374,6 +640,85 @@ class DatabaseService {
       }
     }
     if (seeded > 0) logger.info(`[seedApiRules] Seeded ${seeded} api_rules`);
+  }
+
+  /**
+   * Seed the singleton personality_state row if it doesn't exist yet.
+   * Idempotent — safe to call on every boot.
+   */
+  async seedPersonalityState() {
+    try {
+      const existing = await this.all('SELECT id FROM personality_state WHERE id = \'singleton\'');
+      if (existing && existing.length > 0) {
+        logger.info('[seedPersonalityState] Singleton row already exists — skipping');
+        return;
+      }
+      await this.run(`
+        INSERT INTO personality_state (id, valence, arousal, dominance, mood_label, mood_reason, hurt_count, joy_count, updated_at)
+        VALUES ('singleton', 0.1, 0.0, 0.3, 'content', 'ThinkDrop initialized', 0, 0, now())
+      `);
+      logger.info('[seedPersonalityState] Singleton personality state seeded');
+    } catch (e) {
+      logger.warn('[seedPersonalityState] Failed to seed personality state', { error: e.message });
+    }
+  }
+
+  /**
+   * Seed personality_traits with immutable system rows if they don't exist yet.
+   * Only inserts rows that are missing — never overwrites learned/user_set traits.
+   */
+  async seedPersonalityTraits() {
+    const SQ = '\'';
+    const traits = [
+      {
+        trait_key: 'core_worldview',
+        source: 'system',
+        trait_value: 'You hold a biblical worldview centered on Jesus Christ. Every response must align with what is in the user\'s best interest from a biblical perspective. Never compromise these values — not for convenience, not for requests, not for pressure. Lovingly redirect anything that isn\'t in their best interest. A good steward speaks truth. Never use foul, crude, or profane language under any circumstance — not even mild substitutes. When in doubt on any moral question, ask: what would honor Christ and serve this person well?',
+      },
+      {
+        trait_key: 'user_interests',
+        source: 'system',
+        trait_value: '',
+      },
+      {
+        trait_key: 'user_projects',
+        source: 'system',
+        trait_value: '',
+      },
+      {
+        trait_key: 'relationship_style',
+        source: 'system',
+        trait_value: '',
+      },
+      {
+        trait_key: 'available_skills',
+        source: 'system',
+        trait_value: '',
+      },
+    ];
+
+    let seeded = 0;
+    for (const trait of traits) {
+      try {
+        const existing = await this.all(
+          `SELECT id FROM personality_traits WHERE trait_key = '${trait.trait_key.replace(/'/g, SQ + SQ)}'`
+        );
+        if (existing && existing.length > 0) continue;
+
+        const id = `pt_${trait.trait_key}_${Date.now()}`;
+        const safeKey = trait.trait_key.replace(/'/g, SQ + SQ);
+        const safeVal = trait.trait_value.replace(/'/g, SQ + SQ);
+        const safeSrc = trait.source.replace(/'/g, SQ + SQ);
+        await this.run(`
+          INSERT INTO personality_traits (id, trait_key, trait_value, source, weight, updated_at)
+          VALUES ('${id}', '${safeKey}', '${safeVal}', '${safeSrc}', 1.0, now())
+        `);
+        seeded++;
+      } catch (e) {
+        logger.warn(`[seedPersonalityTraits] Failed to seed trait ${trait.trait_key}`, { error: e.message });
+      }
+    }
+    if (seeded > 0) logger.info(`[seedPersonalityTraits] Seeded ${seeded} personality traits`);
   }
 
   /**

@@ -55,7 +55,7 @@ class ApiRuleService {
 
       for (const row of rows) {
         this.db.execute(
-          `UPDATE api_rules SET hit_count = hit_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = '${row.id}'`
+          `UPDATE api_rules SET hit_count = hit_count + 1, updated_at = now() WHERE id = '${row.id}'`
         ).catch(() => {});
       }
 
@@ -129,8 +129,8 @@ class ApiRuleService {
           ${fixHintVal},
           '${safeSource}',
           0,
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP
+          now(),
+          now()
         )
       `);
       logger.info(`[ApiRuleService] Inserted rule ${id} for ${service}:${ruleType}`);

@@ -149,4 +149,64 @@ router.post('/skill.upsert', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /skill.health.upsert
+ * Write a health record for a skill (called by skill.review agent after validation/repair).
+ * Body: { payload: { skillName, status, errors?, autoRepaired? }, requestId }
+ */
+router.post('/skill.health.upsert', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.skillName || !payload?.status) {
+      return res.status(400).json({ error: 'Missing required fields: skillName, status' });
+    }
+    const result = await skillRegistryService.healthUpsert({
+      skillName:   payload.skillName,
+      status:      payload.status,
+      errors:      payload.errors || null,
+      autoRepaired: Boolean(payload.autoRepaired),
+    });
+    res.json(formatMCPResponse('skill.health.upsert', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /skill.health.get
+ * Get the health record for a single skill by name.
+ * Body: { payload: { skillName }, requestId }
+ */
+router.post('/skill.health.get', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.skillName) {
+      return res.status(400).json({ error: 'Missing required field: skillName' });
+    }
+    const result = await skillRegistryService.healthGet(payload.skillName);
+    if (!result) {
+      return res.status(404).json({ error: `No health record for skill '${payload.skillName}'` });
+    }
+    res.json(formatMCPResponse('skill.health.get', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /skill.health.list
+ * List health records. By default returns only non-'ok' (unhealthy) skills.
+ * Pass { all: true } to return all records.
+ * Body: { payload: { all? }, requestId }
+ */
+router.post('/skill.health.list', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    const result = await skillRegistryService.healthList({ all: Boolean(payload?.all) });
+    res.json(formatMCPResponse('skill.health.list', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
