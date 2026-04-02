@@ -38,6 +38,7 @@ import personalityRoute from './routes/personality.js';
 import fingerprintRoute from './routes/fingerprint.js';
 import userProfileRoute from './routes/userProfile.js';
 import userConstraintsRoute from './routes/userConstraints.js';
+import pendingTasksRoute from './routes/pendingTasks.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -236,6 +237,7 @@ app.use(personalityRoute);
 app.use(fingerprintRoute);
 app.use(userProfileRoute);
 app.use(userConstraintsRoute);
+app.use(pendingTasksRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);

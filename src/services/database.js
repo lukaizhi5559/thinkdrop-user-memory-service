@@ -404,6 +404,31 @@ class DatabaseService {
         // Column already exists on re-start — expected, skip silently
       }
 
+      // Pending long-running tasks (Phase 3: async completion via playwright waitForContent)
+      logger.info('Creating pending_tasks table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS pending_tasks (
+          id TEXT PRIMARY KEY,
+          original_prompt TEXT NOT NULL,
+          sub_prompt TEXT NOT NULL,
+          intent TEXT NOT NULL,
+          step_order INTEGER NOT NULL,
+          plan_context TEXT,
+          status TEXT DEFAULT 'running',
+          completion_signal TEXT,
+          completion_arg TEXT,
+          started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          completed_at TIMESTAMP,
+          result TEXT,
+          error_text TEXT,
+          session_id TEXT,
+          user_id TEXT DEFAULT 'default'
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_pending_tasks_status ON pending_tasks(status)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_pending_tasks_started ON pending_tasks(started_at)');
+      logger.info('pending_tasks table created');
+
       logger.info('Database tables created successfully');
     } catch (error) {
       logger.error('Failed to create tables', { error: error.message, stack: error.stack });
