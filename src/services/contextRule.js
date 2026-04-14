@@ -91,7 +91,7 @@ class ContextRuleService {
     if (!contextKey || !ruleText) throw new Error('contextKey and ruleText are required');
 
     const safeKey = contextKey.replace(/'/g, SQ + SQ).toLowerCase().trim();
-    const safeType = contextType === 'app' ? 'app' : 'site';
+    const safeType = ['app', 'agent'].includes(contextType) ? contextType : 'site';
     const safeRule = ruleText.replace(/'/g, SQ + SQ);
     const safeCategory = (category || 'general').replace(/'/g, SQ + SQ);
     const safeSource = (source || 'thinkdrop_ai').replace(/'/g, SQ + SQ);
