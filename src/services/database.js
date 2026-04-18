@@ -208,6 +208,7 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_source ON api_rules(source)');
       logger.info('Api_rules table created');
       await this.seedApiRules();
+      await this.seedContextRules();
 
       // Create intent_overrides table for user-corrected intent learning.
       // When the user corrects a wrong classification ("no, I meant go to the webpage"),
@@ -639,6 +640,11 @@ class DatabaseService {
       { service: 'jira',        rule_type: 'endpoint', code_pattern: null,
         rule_text: 'https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-post',
         fix_hint: 'Jira REST API create issue' },
+      // ── Gmail compose UX gotchas ──────────────────────────────────────────────
+      { service: 'gmail', rule_type: 'gotcha',
+        rule_text: 'After typing a recipient email address in Gmail compose To, CC, or BCC field, always press Enter (not Tab or click-away) to confirm the address as a chip. Verify the chip exists (data-hovercard-id element) before clicking Send. If no chip is present after fill, press Enter and re-check.',
+        code_pattern: 'key.*Tab|press.*Tab|keyboard.*Tab',
+        fix_hint: 'Use keyboard.press("Enter") after filling recipient field, then verify document.querySelector("[data-hovercard-id]") exists before proceeding to Send.' },
     ];
 
     let seeded = 0;
@@ -665,6 +671,65 @@ class DatabaseService {
       }
     }
     if (seeded > 0) logger.info(`[seedApiRules] Seeded ${seeded} api_rules`);
+  }
+
+  /**
+   * Seed system-level context_rules used by the planning pipeline.
+   * Idempotent — skips any rule whose rule_text already exists.
+   */
+  async seedContextRules() {
+    const SQ = "'";
+    const rules = [
+      {
+        context_type: 'global',
+        context_key: 'planning',
+        category: 'planning',
+        rule_text: [
+          'Service method decision tree (apply when choosing how to call an external service):',
+          '1. OAuth token exists ($SERVICE_ACCESS_TOKEN injected) → use shell.run + curl/REST API directly. This is fastest and most reliable.',
+          '2. Token missing AND service supports OAuth (google, microsoft, github, slack, etc.) → STOP. Surface "Connect to {Service Name}" to the user first. After they connect, use the token path. Do NOT silently fall through to browser automation.',
+          '3. CLI tool available and authenticated → use cli.agent.',
+          '4. No token, no CLI → use browser.agent (full CRUD capability — not a read-only fallback).',
+          'NEVER substitute browser automation for an available API when a token exists or can be obtained via OAuth.',
+        ].join(' '),
+      },
+      {
+        context_type: 'site',
+        context_key: 'gmail.agent',
+        category: 'site',
+        rule_text: [
+          'Gmail compose rules:',
+          '(1) After clicking Compose, always snapshot before filling any field.',
+          '(2) Fill the To: / CC: / BCC: field then press Enter (NOT Tab) to confirm the recipient as a chip.',
+          '(3) Verify the chip exists ([data-hovercard-id] element) before filling Subject or body.',
+          '(4) The email body is a contenteditable div — click it first, then use type (not fill).',
+          '(5) If a compose or draft window is already open when you start, close it (click its X or press Escape) and open a fresh Compose window.',
+        ].join(' '),
+      },
+    ];
+
+    let seeded = 0;
+    for (const rule of rules) {
+      try {
+        const safeKey  = rule.context_key.replace(/'/g, SQ + SQ);
+        const safeText = rule.rule_text.replace(/'/g, SQ + SQ);
+        const existing = await this.all(
+          `SELECT id FROM context_rules WHERE context_key = '${safeKey}' AND rule_text = '${safeText}'`
+        );
+        if (existing && existing.length > 0) continue;
+        const id = `cr_seed_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        const safeType     = (rule.context_type || 'global').replace(/'/g, SQ + SQ);
+        const safeCategory = (rule.category || 'general').replace(/'/g, SQ + SQ);
+        await this.run(`
+          INSERT INTO context_rules (id, context_type, context_key, rule_text, category, source, hit_count, created_at, updated_at)
+          VALUES ('${id}','${safeType}','${safeKey}','${safeText}','${safeCategory}','system',0,now(),now())
+        `);
+        seeded++;
+      } catch (e) {
+        logger.warn(`[seedContextRules] Failed to seed ${rule.context_key}`, { error: e.message });
+      }
+    }
+    if (seeded > 0) logger.info(`[seedContextRules] Seeded ${seeded} context_rules`);
   }
 
   /**
