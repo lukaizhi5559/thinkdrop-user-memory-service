@@ -1,5 +1,6 @@
 import { getDatabaseService } from './database.js';
 import logger from '../utils/logger.js';
+import { encryptValue, isBridgeAvailable } from './cryptoBridgeClient.js';
 
 // ---------------------------------------------------------------------------
 // UserProfileService — per-user identity facts and per-service credential
@@ -84,6 +85,8 @@ class UserProfileService {
   /**
    * Retrieve one profile entry by key.
    * Returns null when not found.
+   * When the crypto bridge is available, SAFE: and KEYTAR: refs are transparently
+   * decrypted so callers always receive the plaintext value in valueRef.
    */
   async get(key) {
     if (!key) return null;
@@ -93,7 +96,23 @@ class UserProfileService {
         `SELECT * FROM user_profile WHERE key = '${safeKey}' LIMIT 1`
       );
       if (rows.length === 0) return null;
-      return this._row(rows[0]);
+      const row = this._row(rows[0]);
+      // Transparent decryption — resolve SAFE: / KEYTAR: refs when possible
+      if (row.valueRef && (row.valueRef.startsWith('SAFE:') || row.valueRef.startsWith('KEYTAR:'))) {
+        try {
+          const { resolveValueRef, isBridgeAvailable } = await import('./cryptoBridgeClient.js');
+          if (isBridgeAvailable() || row.valueRef.startsWith('KEYTAR:')) {
+            const plaintext = await resolveValueRef(row.valueRef);
+            if (plaintext !== null && plaintext !== undefined) {
+              row.valueRef = plaintext;
+            }
+          }
+        } catch (_decryptErr) {
+          // Non-fatal — return raw ref so caller can handle or ignore
+          logger.debug(`[UserProfileService] get: decrypt skipped for key="${safeKey}": ${_decryptErr.message}`);
+        }
+      }
+      return row;
     } catch (error) {
       logger.error('[UserProfileService] get failed:', error.message);
       return null;
@@ -138,40 +157,68 @@ class UserProfileService {
   }
 
   /**
-   * Store a raw credential value in the OS keychain and register its KEYTAR
-   * ref pointer in the user_profile table.
+   * Store a raw credential value using the crypto bridge (Electron safeStorage),
+   * falling back to the macOS keychain when the bridge is not available.
    *
    * Security contract:
-   *   - The raw `value` is passed to `security add-generic-password` via
-   *     spawnSync with an explicit args array (NO shell interpolation — safe
-   *     against injection regardless of what the value contains).
-   *   - The raw value is NEVER stored in DuckDB, never returned in responses.
-   *   - Only the `KEYTAR:<keytarKey>` pointer is persisted.
+   *   - When the bridge is available: the raw `value` is encrypted via the
+   *     main-process safeStorage bridge.  The ciphertext is stored as
+   *     `SAFE:<base64>` in value_ref — never the raw secret.
+   *   - When the bridge is unavailable (e.g. during tests or CLI): falls back to
+   *     the macOS `security` command for backward compatibility.  The KEYTAR: prefix
+   *     is preserved so existing reads continue to work.
+   *   - The raw value is NEVER returned in responses or written to disk as plaintext.
+   *
+   * Existing `KEYTAR:` entries are read transparently by resolveValueRef()
+   * in cryptoBridgeClient.js.
    */
   async storeSecret(keytarKey, value, service = null, label = null) {
     if (!keytarKey || value === undefined || value === null) {
       throw new Error('keytarKey and value are required');
     }
-    const { spawnSync } = await import('child_process');
 
-    // Write to macOS keychain (-U = update if already exists)
+    let keyRef;
+
+    if (isBridgeAvailable()) {
+      // ── Crypto bridge path (preferred) ─────────────────────────────────────
+      try {
+        const ciphertext = await encryptValue(String(value));
+        keyRef = `SAFE:${ciphertext}`;
+        logger.info(`[UserProfileService] storeSecret: "${keytarKey}" → SAFE (crypto bridge)`);
+      } catch (bridgeErr) {
+        logger.warn(`[UserProfileService] Crypto bridge encrypt failed for "${keytarKey}", falling back to keychain: ${bridgeErr.message}`);
+        keyRef = await this._storeInKeychain(keytarKey, value);
+      }
+    } else {
+      // ── Legacy keychain fallback ─────────────────────────────────────────────
+      logger.debug(`[UserProfileService] Crypto bridge unavailable — using keychain for "${keytarKey}"`);
+      keyRef = await this._storeInKeychain(keytarKey, value);
+    }
+
+    // Register the ref in user_profile so credentialIntelligence can find it
+    const refKey  = `${keytarKey.toLowerCase()}_ref`;
+    const profile = await this.set(refKey, keyRef, { sensitive: 1, service, label });
+
+    logger.info(`[UserProfileService] storeSecret: "${keytarKey}" → profile ref "${refKey}"`);
+    return { stored: true, keytarKey, keyRef, profileId: profile.id };
+  }
+
+  /**
+   * Store a value in macOS keychain and return the KEYTAR: ref string.
+   * Internal helper — used as the legacy fallback inside storeSecret().
+   * @private
+   */
+  async _storeInKeychain(keytarKey, value) {
+    const { spawnSync } = await import('child_process');
     const proc = spawnSync(
       'security',
       ['add-generic-password', '-s', 'thinkdrop', '-a', keytarKey, '-w', String(value), '-U'],
       { encoding: 'utf8' }
     );
     if (proc.status !== 0 && proc.status !== null) {
-      // Log warning but don't throw — some machines may not have `security`
       logger.warn(`[UserProfileService] keychain write for "${keytarKey}" exited ${proc.status}: ${(proc.stderr || '').trim()}`);
     }
-
-    // Register the KEYTAR ref in user_profile so credentialIntelligence can find it
-    const keyRef  = `KEYTAR:${keytarKey}`;
-    const refKey  = `${keytarKey.toLowerCase()}_ref`;
-    const profile = await this.set(refKey, keyRef, { sensitive: 1, service, label });
-
-    logger.info(`[UserProfileService] storeSecret: "${keytarKey}" → keychain + profile ref "${refKey}"`);
-    return { stored: true, keytarKey, keyRef, profileId: profile.id };
+    return `KEYTAR:${keytarKey}`;
   }
 
   _row(r) {

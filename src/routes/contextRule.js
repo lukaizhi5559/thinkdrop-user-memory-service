@@ -84,4 +84,22 @@ router.post('/context_rule.delete', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /context_rule.delete_by_key
+ * Delete ALL rules for a given context key (stale-rule eviction).
+ * Body: { payload: { contextKey }, context, requestId }
+ */
+router.post('/context_rule.delete_by_key', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.contextKey) {
+      return res.status(400).json({ error: 'Missing required field: contextKey' });
+    }
+    const result = await contextRuleService.deleteByKey(payload.contextKey);
+    res.json(formatMCPResponse('context_rule.delete_by_key', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;

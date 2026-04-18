@@ -184,6 +184,21 @@ class ContextRuleService {
       throw error;
     }
   }
+
+  /**
+   * Delete all rules for a given context key (e.g. after stale-rule eviction).
+   */
+  async deleteByKey(contextKey) {
+    try {
+      const safeKey = contextKey.replace(/'/g, SQ + SQ).toLowerCase().trim();
+      await this.db.execute(`DELETE FROM context_rules WHERE context_key = '${safeKey}'`);
+      logger.info(`[ContextRuleService] deleteByKey: removed all rules for context_key='${safeKey}'`);
+      return { deleted: true };
+    } catch (error) {
+      logger.error('[ContextRuleService] deleteByKey failed:', error.message);
+      throw error;
+    }
+  }
 }
 
 let _instance = null;
