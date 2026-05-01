@@ -77,7 +77,7 @@ function validateContract(contractMd) {
   if (fm.exec_type === 'node' && resolvedPath.endsWith('.md')) {
     throw new Error(
       `Invalid skill contract: exec_type 'node' requires a .cjs exec_path, but got "${fm.exec_path}". ` +
-      `Contract/shell skills must use exec_type: shell.`
+      'Contract/shell skills must use exec_type: shell.'
     );
   }
   if ((resolvedPath.endsWith('.cjs') || resolvedPath.endsWith('.js')) && fm.exec_type !== 'node') {
@@ -98,7 +98,7 @@ function validateContract(contractMd) {
   if (fenceCount % 2 !== 0) {
     throw new Error(
       `Skill contract appears truncated — odd number of code fences (${fenceCount}). ` +
-      `Increase synthesize maxTokens and regenerate the skill.`
+      'Increase synthesize maxTokens and regenerate the skill.'
     );
   }
 
@@ -106,7 +106,7 @@ function validateContract(contractMd) {
   if (bodyText.trim().length < 50) {
     throw new Error(
       `Skill contract body is too short (${bodyText.trim().length} chars). ` +
-      `The contract was likely truncated or failed to generate.`
+      'The contract was likely truncated or failed to generate.'
     );
   }
 
@@ -114,9 +114,9 @@ function validateContract(contractMd) {
   //    being stored and later injected as "CRITICAL RULES" into the planner.
   if (/\.thinkdrop\/tokens\//.test(bodyText)) {
     throw new Error(
-      `Skill contract contains a forbidden OAuth token file read pattern ` +
-      `(~/.thinkdrop/tokens/). Use the pre-injected $<PROVIDER>_ACCESS_TOKEN ` +
-      `env var instead. Fix the ## Auth section and reinstall.`
+      'Skill contract contains a forbidden OAuth token file read pattern ' +
+      '(~/.thinkdrop/tokens/). Use the pre-injected $<PROVIDER>_ACCESS_TOKEN ' +
+      'env var instead. Fix the ## Auth section and reinstall.'
     );
   }
   // ── End contract body quality checks ──────────────────────────────────────
@@ -396,7 +396,7 @@ class SkillRegistryService {
    * Pass { all: true } to return all health records.
    */
   async healthList({ all = false } = {}) {
-    const where = all ? '' : `WHERE h.status != 'ok'`;
+    const where = all ? '' : 'WHERE h.status != \'ok\'';
     const rows = await this.db.query(`
       SELECT h.skill_name, h.status, h.errors, h.last_checked_at, h.auto_repaired,
              s.exec_type, s.exec_path, s.enabled
