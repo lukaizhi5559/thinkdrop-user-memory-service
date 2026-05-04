@@ -261,9 +261,16 @@ class SkillRegistryService {
    */
   async listNames() {
     const rows = await this.db.query(`
-      SELECT name, description, exec_type, exec_path FROM installed_skills WHERE enabled = true ORDER BY name ASC
+      SELECT name, description, exec_type, exec_path, source_domain, source_action FROM installed_skills WHERE enabled = true ORDER BY name ASC
     `);
-    return rows.map(r => ({ name: r.name, description: r.description, execType: r.exec_type, execPath: r.exec_path }));
+    return rows.map(r => ({
+      name: r.name,
+      description: r.description,
+      execType: r.exec_type,
+      execPath: r.exec_path,
+      sourceDomain: r.source_domain || null,
+      sourceAction: r.source_action || null,
+    }));
   }
 
   /**
@@ -271,7 +278,7 @@ class SkillRegistryService {
    * Used by the installSkill node after the build pipeline writes the .cjs file.
    * Returns { id, name, created: bool }.
    */
-  async upsert({ name, description, execPath, execType = 'node', enabled = true, contractMd = '' }) {
+  async upsert({ name, description, execPath, execType = 'node', enabled = true, contractMd = '', sourceDomain = null, sourceAction = null }) {
     if (!name || !execPath) throw new Error('upsert requires name and execPath');
 
     const resolvedPath = execPath.startsWith('~/')
@@ -283,6 +290,7 @@ class SkillRegistryService {
     }
 
     const safe = (s) => String(s).replace(/'/g, SQ + SQ);
+    const safeOrNull = (s) => s ? `'${safe(s)}'` : 'NULL';
     const existing = await this.db.query(
       `SELECT id FROM installed_skills WHERE name = '${safe(name)}'`
     );
@@ -291,12 +299,14 @@ class SkillRegistryService {
       const id = existing[0].id;
       await this.db.execute(`
         UPDATE installed_skills
-        SET description = '${safe(description || '')}',
-            exec_path   = '${safe(resolvedPath)}',
-            exec_type   = '${safe(execType)}',
-            contract_md = '${safe(contractMd || '')}',
-            enabled     = ${enabled ? 'true' : 'false'},
-            updated_at  = now()
+        SET description   = '${safe(description || '')}',
+            exec_path     = '${safe(resolvedPath)}',
+            exec_type     = '${safe(execType)}',
+            contract_md   = '${safe(contractMd || '')}',
+            enabled       = ${enabled ? 'true' : 'false'},
+            source_domain = ${safeOrNull(sourceDomain)},
+            source_action = ${safeOrNull(sourceAction)},
+            updated_at    = now()
         WHERE id = '${id}'
       `);
       logger.info(`[SkillRegistry] Upserted (updated) skill: ${name}`);
@@ -305,7 +315,7 @@ class SkillRegistryService {
 
     const id = generateId();
     await this.db.execute(`
-      INSERT INTO installed_skills (id, name, description, contract_md, exec_path, exec_type, enabled, installed_at, updated_at)
+      INSERT INTO installed_skills (id, name, description, contract_md, exec_path, exec_type, enabled, source_domain, source_action, installed_at, updated_at)
       VALUES (
         '${id}',
         '${safe(name)}',
@@ -314,6 +324,8 @@ class SkillRegistryService {
         '${safe(resolvedPath)}',
         '${safe(execType)}',
         ${enabled ? 'true' : 'false'},
+        ${safeOrNull(sourceDomain)},
+        ${safeOrNull(sourceAction)},
         now(),
         now()
       )

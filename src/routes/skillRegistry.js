@@ -136,12 +136,14 @@ router.post('/skill.upsert', async (req, res, next) => {
     }
 
     const result = await skillRegistryService.upsert({
-      name:        payload.name,
-      description: payload.description || '',
-      execPath:    payload.execPath,
-      execType:    payload.execType || 'node',
-      enabled:     payload.enabled !== false,
-      contractMd:  payload.contractMd || '',
+      name:         payload.name,
+      description:  payload.description || '',
+      execPath:     payload.execPath,
+      execType:     payload.execType || 'node',
+      enabled:      payload.enabled !== false,
+      contractMd:   payload.contractMd || '',
+      sourceDomain: payload.sourceDomain || null,
+      sourceAction: payload.sourceAction || null,
     });
     res.json(formatMCPResponse('skill.upsert', requestId, 'ok', result));
   } catch (error) {

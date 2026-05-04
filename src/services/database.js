@@ -278,6 +278,9 @@ class DatabaseService {
       `);
       await this.run('CREATE INDEX IF NOT EXISTS idx_installed_skills_name ON installed_skills(name)');
       await this.run('CREATE INDEX IF NOT EXISTS idx_installed_skills_enabled ON installed_skills(enabled)');
+      // Migration: add source_domain and source_action columns if they don't exist yet
+      await this.run('ALTER TABLE installed_skills ADD COLUMN IF NOT EXISTS source_domain TEXT').catch(() => {});
+      await this.run('ALTER TABLE installed_skills ADD COLUMN IF NOT EXISTS source_action TEXT').catch(() => {});
       logger.info('Installed_skills table created');
 
       // Create skill_health table — tracks structural validation state per skill.
@@ -399,7 +402,7 @@ class DatabaseService {
 
       // Migration: add override_pin for existing databases (idempotent — throws if already present)
       try {
-        await this.run(`ALTER TABLE user_constraints ADD COLUMN override_pin TEXT DEFAULT NULL`);
+        await this.run('ALTER TABLE user_constraints ADD COLUMN override_pin TEXT DEFAULT NULL');
         logger.info('[DB Migration] user_constraints: added override_pin column');
       } catch (_) {
         // Column already exists on re-start — expected, skip silently
@@ -678,7 +681,7 @@ class DatabaseService {
    * Idempotent — skips any rule whose rule_text already exists.
    */
   async seedContextRules() {
-    const SQ = "'";
+    const SQ = '\'';
     const rules = [
       {
         context_type: 'global',

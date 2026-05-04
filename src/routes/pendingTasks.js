@@ -32,11 +32,9 @@ router.post('/pending_tasks.create', async (req, res, next) => {
         (id, original_prompt, sub_prompt, intent, step_order, plan_context,
          status, completion_signal, completion_arg, session_id, user_id)
        VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
-      [
-        id, original_prompt, sub_prompt, intent, step_order,
-        plan_context || null, completion_signal || 'waitForContent',
-        completion_arg || '', session_id || null, user_id,
-      ]
+      id, original_prompt, sub_prompt, intent, step_order,
+      plan_context || null, completion_signal || 'waitForContent',
+      completion_arg || '', session_id || null, user_id
     );
 
     res.json(formatMCPResponse('pending_tasks.create', requestId, 'ok', { id }));
@@ -59,17 +57,17 @@ router.post('/pending_tasks.list', async (req, res, next) => {
     if (id) {
       tasks = await db().all(
         'SELECT * FROM pending_tasks WHERE id = ?',
-        [id]
+        id
       );
     } else if (status) {
       tasks = await db().all(
         'SELECT * FROM pending_tasks WHERE status = ? ORDER BY started_at DESC LIMIT ?',
-        [status, limit]
+        status, limit
       );
     } else {
       tasks = await db().all(
         'SELECT * FROM pending_tasks ORDER BY started_at DESC LIMIT ?',
-        [limit]
+        limit
       );
     }
 
@@ -108,7 +106,7 @@ router.post('/pending_tasks.update', async (req, res, next) => {
     values.push(id);
     await db().run(
       `UPDATE pending_tasks SET ${setClauses.join(', ')} WHERE id = ?`,
-      values
+      ...values
     );
 
     res.json(formatMCPResponse('pending_tasks.update', requestId, 'ok', { id }));
@@ -132,8 +130,8 @@ router.post('/pending_tasks.cancel', async (req, res, next) => {
     }
 
     await db().run(
-      `UPDATE pending_tasks SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [id]
+      'UPDATE pending_tasks SET status = \'cancelled\', completed_at = CURRENT_TIMESTAMP WHERE id = ?',
+      id
     );
 
     res.json(formatMCPResponse('pending_tasks.cancel', requestId, 'ok', { id, status: 'cancelled' }));
