@@ -102,4 +102,76 @@ router.post('/context_rule.delete_by_key', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /context_rule.list_all
+ * List all rules grouped by context_key.
+ * Body: { context, requestId }
+ */
+router.post('/context_rule.list_all', async (req, res, next) => {
+  try {
+    const { requestId } = req.body;
+    const grouped = await contextRuleService.listAllGrouped();
+    res.json(formatMCPResponse('context_rule.list_all', requestId, 'ok', { grouped }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /context_rule.update
+ * Update a rule by ID with partial updates.
+ * Body: { payload: { id, updates: { rule_text?, category?, priority?, user_note?, status? } }, context, requestId }
+ */
+router.post('/context_rule.update', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.id) {
+      return res.status(400).json({ error: 'Missing required field: id' });
+    }
+    if (!payload?.updates || typeof payload.updates !== 'object') {
+      return res.status(400).json({ error: 'Missing required field: updates (object)' });
+    }
+    const result = await contextRuleService.update(payload.id, payload.updates);
+    res.json(formatMCPResponse('context_rule.update', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /context_rule.delete_by_id
+ * Delete a rule by ID (explicit endpoint name).
+ * Body: { payload: { id }, context, requestId }
+ */
+router.post('/context_rule.delete_by_id', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.id) {
+      return res.status(400).json({ error: 'Missing required field: id' });
+    }
+    const result = await contextRuleService.deleteById(payload.id);
+    res.json(formatMCPResponse('context_rule.delete_by_id', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /context_rule.analyze_cleanup
+ * Get rules for a specific context key for LLM cleanup analysis.
+ * Body: { payload: { contextKey }, context, requestId }
+ */
+router.post('/context_rule.analyze_cleanup', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.contextKey) {
+      return res.status(400).json({ error: 'Missing required field: contextKey' });
+    }
+    const result = await contextRuleService.cleanupDomain(payload.contextKey);
+    res.json(formatMCPResponse('context_rule.analyze_cleanup', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;

@@ -2,6 +2,7 @@ import { getDatabaseService } from './database.js';
 import logger from '../utils/logger.js';
 import path from 'path';
 import os from 'os';
+import fs from 'fs';
 
 const SQ = '\x27';
 const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
@@ -263,14 +264,28 @@ class SkillRegistryService {
     const rows = await this.db.query(`
       SELECT name, description, exec_type, exec_path, source_domain, source_action FROM installed_skills WHERE enabled = true ORDER BY name ASC
     `);
-    return rows.map(r => ({
-      name: r.name,
-      description: r.description,
-      execType: r.exec_type,
-      execPath: r.exec_path,
-      sourceDomain: r.source_domain || null,
-      sourceAction: r.source_action || null,
-    }));
+    return rows.map(r => {
+      // Disk cross-check: read skill.json to pick up goal_tied flag.
+      // The DB schema predates goal_tied so the column may not exist yet.
+      // Reading from disk is non-breaking and requires no migration.
+      let goalTied = false;
+      try {
+        const sjPath = path.join(SKILLS_BASE_DIR, r.name, 'skill.json');
+        if (fs.existsSync(sjPath)) {
+          const sj = JSON.parse(fs.readFileSync(sjPath, 'utf8'));
+          goalTied = sj.goal_tied === true;
+        }
+      } catch (_) { /* skill.json unreadable — goalTied defaults to false */ }
+      return {
+        name: r.name,
+        description: r.description,
+        execType: r.exec_type,
+        execPath: r.exec_path,
+        sourceDomain: r.source_domain || null,
+        sourceAction: r.source_action || null,
+        goalTied,
+      };
+    });
   }
 
   /**

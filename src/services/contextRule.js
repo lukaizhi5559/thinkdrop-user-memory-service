@@ -46,10 +46,12 @@ class ContextRuleService {
       const typeFilter = contextType ? `AND context_type = '${contextType}'` : '';
 
       const rows = await this.db.query(`
-        SELECT id, context_type, context_key, rule_text, category, source, hit_count, created_at
+        SELECT id, context_type, context_key, rule_text, category, source, hit_count, created_at,
+               status, priority, verified_count, failed_count, last_verified_at, user_note
         FROM context_rules
         WHERE context_key IN (${placeholders}) ${typeFilter}
-        ORDER BY hit_count DESC, created_at DESC
+          AND (status IS NULL OR status = 'active')
+        ORDER BY priority DESC, verified_count DESC, hit_count DESC, created_at DESC
       `);
 
       // Bump hit_count for matched rows (fire-and-forget)
@@ -68,7 +70,13 @@ class ContextRuleService {
           ruleText: r.rule_text,
           category: r.category || 'general',
           source: r.source || 'thinkdrop_ai',
-          hitCount: Number(r.hit_count)
+          hitCount: Number(r.hit_count),
+          status: r.status || 'active',
+          priority: Number(r.priority || 0),
+          verifiedCount: Number(r.verified_count || 0),
+          failedCount: Number(r.failed_count || 0),
+          lastVerifiedAt: r.last_verified_at,
+          userNote: r.user_note
         }))
       };
     } catch (error) {
@@ -146,10 +154,11 @@ class ContextRuleService {
       const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
 
       const rows = await this.db.query(`
-        SELECT id, context_type, context_key, rule_text, category, source, hit_count, created_at, updated_at
+        SELECT id, context_type, context_key, rule_text, category, source, hit_count, created_at, updated_at,
+               status, priority, verified_count, failed_count, last_verified_at, user_note
         FROM context_rules
         ${where}
-        ORDER BY context_key, hit_count DESC, created_at DESC
+        ORDER BY context_key, priority DESC, verified_count DESC, hit_count DESC, created_at DESC
         LIMIT ${limit}
       `);
       return {
@@ -162,7 +171,13 @@ class ContextRuleService {
           source: r.source,
           hitCount: Number(r.hit_count),
           createdAt: r.created_at,
-          updatedAt: r.updated_at
+          updatedAt: r.updated_at,
+          status: r.status || 'active',
+          priority: Number(r.priority || 0),
+          verifiedCount: Number(r.verified_count || 0),
+          failedCount: Number(r.failed_count || 0),
+          lastVerifiedAt: r.last_verified_at,
+          userNote: r.user_note
         })),
         total: rows.length
       };
@@ -197,6 +212,139 @@ class ContextRuleService {
     } catch (error) {
       logger.error('[ContextRuleService] deleteByKey failed:', error.message);
       throw error;
+    }
+  }
+
+  /**
+   * List all rules grouped by context_key.
+   * Returns { 'mail.google.com': [rules], 'github.com': [rules], ... }
+   */
+  async listAllGrouped() {
+    try {
+      const rows = await this.db.query(`
+        SELECT id, context_type, context_key, rule_text, category, source, hit_count, created_at, updated_at,
+               status, priority, verified_count, failed_count, last_verified_at, user_note
+        FROM context_rules
+        WHERE status IS NULL OR status = 'active'
+        ORDER BY context_key ASC, priority DESC, verified_count DESC, hit_count DESC, updated_at DESC
+      `);
+
+      const grouped = rows.reduce((acc, r) => {
+        if (!acc[r.context_key]) acc[r.context_key] = [];
+        acc[r.context_key].push({
+          id: r.id,
+          contextType: r.context_type,
+          contextKey: r.context_key,
+          ruleText: r.rule_text,
+          category: r.category || 'general',
+          source: r.source || 'thinkdrop_ai',
+          hitCount: Number(r.hit_count || 0),
+          createdAt: r.created_at,
+          updatedAt: r.updated_at,
+          status: r.status || 'active',
+          priority: Number(r.priority || 0),
+          verifiedCount: Number(r.verified_count || 0),
+          failedCount: Number(r.failed_count || 0),
+          lastVerifiedAt: r.last_verified_at,
+          userNote: r.user_note
+        });
+        return acc;
+      }, {});
+
+      logger.info(`[ContextRuleService] listAllGrouped: ${rows.length} rules across ${Object.keys(grouped).length} domains`);
+      return grouped;
+    } catch (error) {
+      logger.error('[ContextRuleService] listAllGrouped failed:', error.message);
+      return {};
+    }
+  }
+
+  /**
+   * Update a rule by ID with partial updates.
+   * Allowed fields: rule_text, category, priority, user_note, status
+   */
+  async update(id, updates) {
+    const allowed = ['rule_text', 'category', 'priority', 'user_note', 'status'];
+    const setPairs = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (!allowed.includes(key)) continue;
+      if (value === undefined) continue;
+
+      if (key === 'priority') {
+        setPairs.push(`${key} = ${Number(value)}`);
+      } else if (key === 'rule_text' || key === 'category' || key === 'user_note' || key === 'status') {
+        setPairs.push(`${key} = '${String(value).replace(/'/g, SQ + SQ)}'`);
+      }
+    }
+
+    if (setPairs.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    setPairs.push(`updated_at = now()`);
+
+    try {
+      const safeId = String(id).replace(/'/g, SQ + SQ);
+      await this.db.execute(`
+        UPDATE context_rules
+        SET ${setPairs.join(', ')}
+        WHERE id = '${safeId}'
+      `);
+      logger.info(`[ContextRuleService] Updated rule ${id}`);
+      return { updated: true, id };
+    } catch (error) {
+      logger.error('[ContextRuleService] update failed:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete a rule by ID (explicit method name).
+   */
+  async deleteById(id) {
+    return this.delete(id);
+  }
+
+  /**
+   * Get rules for a specific context key for cleanup analysis.
+   * Returns raw data for LLM analysis.
+   */
+  async cleanupDomain(contextKey) {
+    try {
+      const safeKey = String(contextKey).replace(/'/g, SQ + SQ).toLowerCase().trim();
+      const rows = await this.db.query(`
+        SELECT id, context_type, context_key, rule_text, category, source, hit_count, created_at, updated_at,
+               status, priority, verified_count, failed_count, last_verified_at, user_note
+        FROM context_rules
+        WHERE context_key = '${safeKey}'
+          AND (status IS NULL OR status = 'active')
+        ORDER BY priority DESC, verified_count DESC, hit_count DESC, updated_at DESC
+      `);
+
+      const rules = rows.map(r => ({
+        id: r.id,
+        contextType: r.context_type,
+        contextKey: r.context_key,
+        ruleText: r.rule_text,
+        category: r.category || 'general',
+        source: r.source || 'thinkdrop_ai',
+        hitCount: Number(r.hit_count || 0),
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+        status: r.status || 'active',
+        priority: Number(r.priority || 0),
+        verifiedCount: Number(r.verified_count || 0),
+        failedCount: Number(r.failed_count || 0),
+        lastVerifiedAt: r.last_verified_at,
+        userNote: r.user_note
+      }));
+
+      logger.info(`[ContextRuleService] cleanupDomain: ${rules.length} rules for ${contextKey}`);
+      return { contextKey, rules, count: rules.length };
+    } catch (error) {
+      logger.error('[ContextRuleService] cleanupDomain failed:', error.message);
+      return { contextKey, rules: [], count: 0 };
     }
   }
 }

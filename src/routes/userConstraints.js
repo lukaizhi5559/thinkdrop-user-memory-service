@@ -83,4 +83,25 @@ router.post('/constraint.remove', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /constraint.update
+ * Update a constraint by id.
+ * Body: { payload: { id, updates: { rule?, severity?, scope?, blocks? } }, context, requestId }
+ */
+router.post('/constraint.update', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+    if (!payload?.id) {
+      return res.status(400).json({ error: 'Missing required field: id' });
+    }
+    if (!payload?.updates || typeof payload.updates !== 'object') {
+      return res.status(400).json({ error: 'Missing required field: updates (object)' });
+    }
+    const result = await constraintsService.update(payload.id, payload.updates);
+    res.json(formatMCPResponse('constraint.update', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;

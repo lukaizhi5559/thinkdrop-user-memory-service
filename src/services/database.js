@@ -182,6 +182,34 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_context_rules_category ON context_rules(category)');
       logger.info('Context_rules table created');
 
+      // Migration: Add new columns for rule management (idempotent - safe to re-run)
+      logger.info('Running context_rules migration...');
+      try {
+        await this.run(`ALTER TABLE context_rules ADD COLUMN status TEXT DEFAULT 'active'`);
+        logger.info('  + Added status column');
+      } catch (e) { /* Column exists */ }
+      try {
+        await this.run(`ALTER TABLE context_rules ADD COLUMN priority INTEGER DEFAULT 0`);
+        logger.info('  + Added priority column');
+      } catch (e) { /* Column exists */ }
+      try {
+        await this.run(`ALTER TABLE context_rules ADD COLUMN verified_count INTEGER DEFAULT 0`);
+        logger.info('  + Added verified_count column');
+      } catch (e) { /* Column exists */ }
+      try {
+        await this.run(`ALTER TABLE context_rules ADD COLUMN failed_count INTEGER DEFAULT 0`);
+        logger.info('  + Added failed_count column');
+      } catch (e) { /* Column exists */ }
+      try {
+        await this.run(`ALTER TABLE context_rules ADD COLUMN last_verified_at TIMESTAMP`);
+        logger.info('  + Added last_verified_at column');
+      } catch (e) { /* Column exists */ }
+      try {
+        await this.run(`ALTER TABLE context_rules ADD COLUMN user_note TEXT`);
+        logger.info('  + Added user_note column');
+      } catch (e) { /* Column exists */ }
+      logger.info('Context_rules migration complete');
+
       // Create api_rules table for per-service API contract rules used by skill generation pipeline
       // service:   npm/API service name (e.g. 'clicksend', 'twilio', 'stripe', 'gmail')
       // rule_type: 'auth' | 'payload' | 'secret' | 'endpoint' | 'gotcha'

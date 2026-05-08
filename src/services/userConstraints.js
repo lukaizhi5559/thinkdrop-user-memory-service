@@ -235,6 +235,47 @@ class UserConstraintsService {
       throw error;
     }
   }
+
+  /**
+   * Update a constraint by id.
+   * Allowed fields: rule, severity, scope, blocks
+   */
+  async update(id, updates) {
+    if (!id) throw new Error('id is required');
+    const allowed = ['rule', 'severity', 'scope', 'blocks'];
+    const setPairs = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (!allowed.includes(key)) continue;
+      if (value === undefined) continue;
+
+      if (key === 'blocks') {
+        setPairs.push(`blocks = ${value ? `'${JSON.stringify(value).replace(/'/g, SQ + SQ)}'` : 'NULL'}`);
+      } else {
+        setPairs.push(`${key} = '${String(value).replace(/'/g, SQ + SQ)}'`);
+      }
+    }
+
+    if (setPairs.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    setPairs.push(`updated_at = now()`);
+    const safeId = String(id).replace(/'/g, SQ + SQ);
+
+    try {
+      await this.db.execute(`
+        UPDATE user_constraints
+        SET ${setPairs.join(', ')}
+        WHERE id = '${safeId}'
+      `);
+      logger.info(`[UserConstraintsService] updated constraint ${id}`);
+      return { updated: true, id };
+    } catch (error) {
+      logger.error('[UserConstraintsService] update failed:', error.message);
+      throw error;
+    }
+  }
 }
 
 let _instance = null;
