@@ -39,6 +39,7 @@ import fingerprintRoute from './routes/fingerprint.js';
 import userProfileRoute from './routes/userProfile.js';
 import userConstraintsRoute from './routes/userConstraints.js';
 import pendingTasksRoute from './routes/pendingTasks.js';
+import embedRoute from './routes/embed.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -238,6 +239,7 @@ app.use(fingerprintRoute);
 app.use(userProfileRoute);
 app.use(userConstraintsRoute);
 app.use(pendingTasksRoute);
+app.use(embedRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
@@ -292,6 +294,7 @@ async function startServer() {
       console.log('   - POST /personality.getTraits');
       console.log('   - POST /personality.upsertTrait');
       console.log('   - POST /personality.getOverlay');
+      console.log('   - POST /memory.embed');
       if (process.env.MONITOR_SCREEN_OCR === 'true') {
         console.log('\n👁️  Screen Monitor: ACTIVE');
         console.log(`   Capture interval: ${process.env.SCREEN_CAPTURE_INTERVAL || 10000}ms`);
