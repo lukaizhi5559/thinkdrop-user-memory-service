@@ -40,6 +40,7 @@ import userProfileRoute from './routes/userProfile.js';
 import userConstraintsRoute from './routes/userConstraints.js';
 import pendingTasksRoute from './routes/pendingTasks.js';
 import embedRoute from './routes/embed.js';
+import agentRegistryRoute from './routes/agentRegistry.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -240,6 +241,7 @@ app.use(userProfileRoute);
 app.use(userConstraintsRoute);
 app.use(pendingTasksRoute);
 app.use(embedRoute);
+app.use(agentRegistryRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
