@@ -214,6 +214,7 @@ class MemoryService {
       const sql = `
         SELECT 
           id,
+          type,
           source_text,
           metadata,
           screenshot,
@@ -292,6 +293,7 @@ class MemoryService {
 
           return {
             id: result.id,
+            type: result.type || 'user_memory',
             text: result.source_text,
             similarity: result.similarity,
             entities: entities.map(e => ({
