@@ -13,7 +13,7 @@ import { encryptValue, isBridgeAvailable } from './cryptoBridgeClient.js';
 // Schema: user_profile(id, key, value_ref, sensitive, service, label, ...)
 // ---------------------------------------------------------------------------
 
-const SQ = "'";
+const SQ = '\'';
 
 function generateId() {
   return `up_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
