@@ -7,7 +7,7 @@ import fs from 'fs';
 const SQ = '\x27';
 const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
-const VALID_EXEC_TYPES = ['node', 'shell'];
+const VALID_EXEC_TYPES = ['node', 'shell', 'python'];
 const SKILL_NAME_PATTERN = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 const REQUIRED_FRONTMATTER = ['name', 'description', 'exec_path', 'exec_type'];
 
@@ -73,8 +73,9 @@ function validateContract(contractMd) {
   }
 
   // Cross-field consistency: exec_type and exec_path must agree on skill type.
-  // Rule: exec_type:node → exec_path must be a .cjs/.js file (not .md)
-  //       exec_type:shell → exec_path must be a .md file (not .cjs/.js)
+  // Rule: exec_type:node   → exec_path must be a .cjs/.js file (not .md)
+  //       exec_type:shell  → exec_path must be a .md/.sh file (not .cjs/.js or .py)
+  //       exec_type:python → exec_path must be a .py file
   if (fm.exec_type === 'node' && resolvedPath.endsWith('.md')) {
     throw new Error(
       `Invalid skill contract: exec_type 'node' requires a .cjs exec_path, but got "${fm.exec_path}". ` +
@@ -84,6 +85,16 @@ function validateContract(contractMd) {
   if ((resolvedPath.endsWith('.cjs') || resolvedPath.endsWith('.js')) && fm.exec_type !== 'node') {
     throw new Error(
       `Invalid skill contract: exec_path "${fm.exec_path}" (JS file) requires exec_type: node, but got "${fm.exec_type}".`
+    );
+  }
+  if (resolvedPath.endsWith('.py') && fm.exec_type !== 'python') {
+    throw new Error(
+      `Invalid skill contract: exec_path "${fm.exec_path}" (Python file) requires exec_type: python, but got "${fm.exec_type}".`
+    );
+  }
+  if (fm.exec_type === 'python' && !resolvedPath.endsWith('.py')) {
+    throw new Error(
+      `Invalid skill contract: exec_type 'python' requires a .py exec_path, but got "${fm.exec_path}".`
     );
   }
 
@@ -164,6 +175,7 @@ class SkillRegistryService {
             updated_at   = now()
         WHERE id = '${id}'
       `);
+      await this.db.execute('CHECKPOINT').catch(() => {});
       logger.info(`[SkillRegistry] Updated skill: ${name} (${id})`);
       await this._upsertHealth(name, 'ok', null);
       return { id, name, created: false };
@@ -208,12 +220,12 @@ class SkillRegistryService {
   }
 
   /**
-   * List all installed skills (lightweight — no contract_md).
+   * List all installed skills, including contract_md for schedule parsing.
    */
   async list(enabledOnly = false) {
     const where = enabledOnly ? 'WHERE enabled = true' : '';
     const rows = await this.db.query(`
-      SELECT id, name, description, exec_path, exec_type, enabled, installed_at, updated_at
+      SELECT id, name, description, contract_md, exec_path, exec_type, enabled, installed_at, updated_at
       FROM installed_skills
       ${where}
       ORDER BY name ASC
@@ -223,6 +235,7 @@ class SkillRegistryService {
         id: r.id,
         name: r.name,
         description: r.description,
+        contractMd: r.contract_md || '',
         execPath: r.exec_path,
         execType: r.exec_type,
         enabled: Boolean(r.enabled),
@@ -324,6 +337,7 @@ class SkillRegistryService {
             updated_at    = now()
         WHERE id = '${id}'
       `);
+      await this.db.execute('CHECKPOINT').catch(() => {});
       logger.info(`[SkillRegistry] Upserted (updated) skill: ${name}`);
       return { id, name, created: false };
     }
