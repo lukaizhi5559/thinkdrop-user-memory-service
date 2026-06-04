@@ -175,7 +175,6 @@ class SkillRegistryService {
             updated_at   = now()
         WHERE id = '${id}'
       `);
-      await this.db.execute('CHECKPOINT').catch(() => {});
       logger.info(`[SkillRegistry] Updated skill: ${name} (${id})`);
       await this._upsertHealth(name, 'ok', null);
       return { id, name, created: false };
@@ -337,7 +336,6 @@ class SkillRegistryService {
             updated_at    = now()
         WHERE id = '${id}'
       `);
-      await this.db.execute('CHECKPOINT').catch(() => {});
       logger.info(`[SkillRegistry] Upserted (updated) skill: ${name}`);
       return { id, name, created: false };
     }

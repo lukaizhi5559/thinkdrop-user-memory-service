@@ -32,7 +32,9 @@ class SkillPromptService {
 
       const queryEmbedding = await this.embeddings.generateEmbedding(query);
       const embeddingValues = queryEmbedding.map(v => v.toString()).join(',');
-      const queryVector = `[${embeddingValues}]::FLOAT[384]`;
+      const queryVector = `list_value(${embeddingValues})::FLOAT[384]`;
+
+      await this.db.ensureVssLoaded();
 
       const sql = `
         SELECT
@@ -91,7 +93,9 @@ class SkillPromptService {
       const tagsStr = Array.isArray(tags) ? tags.join(', ') : (tags || '');
       const embedding = await this.embeddings.generateEmbedding(promptText);
       const embeddingValues = embedding.map(v => v.toString()).join(',');
-      const queryVector = `[${embeddingValues}]::FLOAT[384]`;
+      const queryVector = `list_value(${embeddingValues})::FLOAT[384]`;
+
+      await this.db.ensureVssLoaded();
 
       // Check for near-duplicate by cosine similarity (>0.92 = essentially the same snippet)
       const dupeCheck = await this.db.query(`

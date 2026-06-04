@@ -10,6 +10,30 @@ class DatabaseService {
     this.db = null;
     this.connection = null;
     this.isInitialized = false;
+    // Serial queue — prevents concurrent calls on the single DuckDB connection.
+    // The DuckDB Node.js binding is NOT concurrency-safe: two simultaneous
+    // promisified calls on the same connection corrupt internal C++ state and
+    // produce the "unique_ptr that is NULL" crash.
+    this._dbQueue = Promise.resolve();
+    // VSS is NOT loaded at startup — see ensureVssLoaded() for the reason.
+    this._vssLoaded = false;
+  }
+
+  /**
+   * Enqueue a database operation so it runs serially.
+   * All calls to _run/_all go through here.
+   */
+  _enqueue(fn) {
+    // Each operation is appended to the queue tail.
+    // The internal chain always resolves (via the inner catch) so a failing
+    // operation never permanently blocks the queue for subsequent callers.
+    // The outer promise re-throws so the individual caller still gets the error.
+    let resolve, reject;
+    const ticket = new Promise((res, rej) => { resolve = res; reject = rej; });
+    this._dbQueue = this._dbQueue.then(() => fn().then(resolve, reject), () => fn().then(resolve, reject));
+    // Suppress unhandled-rejection on the internal chain — caller handles it via ticket
+    this._dbQueue = this._dbQueue.catch(() => {});
+    return ticket;
   }
 
   /**
@@ -26,6 +50,23 @@ class DatabaseService {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
       logger.info(`Created database directory: ${dir}`);
+    }
+
+    // Clean up WAL files from previous crashes to prevent corruption
+    try {
+      const walPath = this.dbPath + '.wal';
+      if (fs.existsSync(walPath)) {
+        logger.info('Removing stale WAL file from previous crash', { walPath });
+        fs.unlinkSync(walPath);
+      }
+      // Also check for temp files
+      const tempPath = this.dbPath + '.tmp';
+      if (fs.existsSync(tempPath)) {
+        logger.info('Removing stale temp file from previous crash', { tempPath });
+        fs.unlinkSync(tempPath);
+      }
+    } catch (cleanupErr) {
+      logger.warn('Failed to cleanup stale database files', { error: cleanupErr.message });
     }
 
     const MAX_RETRIES = 5;
@@ -63,9 +104,10 @@ class DatabaseService {
             // Create connection
             this.connection = this.db.connect();
 
-            // Promisify connection methods
-            this.run = promisify(this.connection.run.bind(this.connection));
-            this.all = promisify(this.connection.all.bind(this.connection));
+            // Promisify connection methods — kept as private _run/_all.
+            // Public run()/all() route through _enqueue() for serialization.
+            this._run = promisify(this.connection.run.bind(this.connection));
+            this._all = promisify(this.connection.all.bind(this.connection));
 
             // Create tables
             await this.createTables();
@@ -75,6 +117,10 @@ class DatabaseService {
 
             this.isInitialized = true;
             logger.info(`Database initialized successfully: ${this.dbPath}`);
+            
+            // Start proactive health checks to detect corruption early
+            this.startHealthCheck();
+            
             resolve();
           } catch (error) {
             reject(error);
@@ -185,27 +231,27 @@ class DatabaseService {
       // Migration: Add new columns for rule management (idempotent - safe to re-run)
       logger.info('Running context_rules migration...');
       try {
-        await this.run(`ALTER TABLE context_rules ADD COLUMN status TEXT DEFAULT 'active'`);
+        await this.run('ALTER TABLE context_rules ADD COLUMN status TEXT DEFAULT \'active\'');
         logger.info('  + Added status column');
       } catch (e) { /* Column exists */ }
       try {
-        await this.run(`ALTER TABLE context_rules ADD COLUMN priority INTEGER DEFAULT 0`);
+        await this.run('ALTER TABLE context_rules ADD COLUMN priority INTEGER DEFAULT 0');
         logger.info('  + Added priority column');
       } catch (e) { /* Column exists */ }
       try {
-        await this.run(`ALTER TABLE context_rules ADD COLUMN verified_count INTEGER DEFAULT 0`);
+        await this.run('ALTER TABLE context_rules ADD COLUMN verified_count INTEGER DEFAULT 0');
         logger.info('  + Added verified_count column');
       } catch (e) { /* Column exists */ }
       try {
-        await this.run(`ALTER TABLE context_rules ADD COLUMN failed_count INTEGER DEFAULT 0`);
+        await this.run('ALTER TABLE context_rules ADD COLUMN failed_count INTEGER DEFAULT 0');
         logger.info('  + Added failed_count column');
       } catch (e) { /* Column exists */ }
       try {
-        await this.run(`ALTER TABLE context_rules ADD COLUMN last_verified_at TIMESTAMP`);
+        await this.run('ALTER TABLE context_rules ADD COLUMN last_verified_at TIMESTAMP');
         logger.info('  + Added last_verified_at column');
       } catch (e) { /* Column exists */ }
       try {
-        await this.run(`ALTER TABLE context_rules ADD COLUMN user_note TEXT`);
+        await this.run('ALTER TABLE context_rules ADD COLUMN user_note TEXT');
         logger.info('  + Added user_note column');
       } catch (e) { /* Column exists */ }
       logger.info('Context_rules migration complete');
@@ -843,86 +889,103 @@ class DatabaseService {
   }
 
   /**
-   * Initialize the VSS extension and create HNSW index for vector similarity search.
-   * The index is rebuilt on each startup (safe approach — experimental persistence
-   * has WAL recovery issues that could corrupt data on crash).
+   * Initialize the VSS extension for vector similarity search.
+   *
+   * IMPORTANT — NO live HNSW index on the `memory` table:
+   * DuckDB v1.4.4's HNSW extension crashes with a fatal C++ NULL ptr deref
+   * (`duckdb::InternalException: unique_ptr that is NULL`) when CHECKPOINT
+   * runs while the HNSW graph is being updated by a concurrent INSERT.
+   * The screen monitor INSERTs every 5 s, so the crash is guaranteed within
+   * ~2 minutes of startup.  This is an upstream DuckDB bug — uncatchable
+   * from JS because it calls std::terminate().
+   *
+   * VSS is still loaded so `array_cosine_distance()` is available.
+   * Brute-force search is used for < 20 k rows (~25–55 ms).
+   * For >= 20 k rows `searchMemory` builds a transient in-memory HNSW
+   * (cached 5 min) to keep latency low without touching the persistent DB.
+   *
+   * Re-enable the persistent index here once DuckDB v1.5+ fixes the bug.
    */
   async initVectorSearch() {
     try {
-      // Install and load the VSS extension
+      // INSTALL downloads/verifies the extension binary to disk — safe at startup
+      // because it does not register any C++ hooks into the running DuckDB instance.
+      // We deliberately do NOT call LOAD vss here.
+      //
+      // WHY: LOAD vss registers C++ catalog hooks that fire on every INSERT into
+      // tables with FLOAT[] columns.  After ~38 consecutive INSERTs the hooks
+      // corrupt internal state → NULL ptr deref → std::terminate() (uncatchable).
+      // Since the screen monitor INSERTs every 5 s 24/7, the crash is guaranteed
+      // within ~3 minutes of startup if VSS is loaded at boot.
+      //
+      // FIX: call ensureVssLoaded() lazily, only when a search is actually
+      // needed (user-triggered).  VSS then loads through _enqueue() — one
+      // serialized operation — and stays loaded for the rest of the session.
       await this.run('INSTALL vss');
-      await this.run('LOAD vss');
-      logger.info('VSS extension loaded');
+      logger.info('VSS extension installed (load deferred to first search)');
 
-      // Drop existing HNSW index if it exists (rebuild fresh on each startup)
+      // Drop any stale HNSW index left over from a previous run
       try {
         await this.run('DROP INDEX IF EXISTS idx_memory_embedding_hnsw');
       } catch (e) {
-        // Index may not exist yet — that's fine
+        // Index may not exist — that's fine
       }
 
-      // Check if there are any records with embeddings to index
-      const result = await this.all(
-        'SELECT COUNT(*) as count FROM memory WHERE embedding IS NOT NULL'
-      );
-      const count = Number(result[0]?.count || 0);
-
-      if (count > 0) {
-        // Create HNSW index with cosine distance metric
-        const startTime = Date.now();
-        await this.run(
-          'CREATE INDEX idx_memory_embedding_hnsw ON memory USING HNSW (embedding) WITH (metric = \'cosine\')'
-        );
-        const elapsed = Date.now() - startTime;
-        logger.info('HNSW vector index created', { records: count, buildTimeMs: elapsed });
-      } else {
-        logger.info('HNSW vector index skipped — no embeddings yet');
-      }
-
-      this.vssEnabled = true;
+      this.vssEnabled = false; // becomes true after ensureVssLoaded() succeeds
+      logger.info('Vector search ready (VSS load deferred — no live HNSW on memory table)');
     } catch (error) {
-      // VSS extension may not be available — fall back to brute-force search
-      logger.warn('VSS extension not available, falling back to brute-force vector search', {
-        error: error.message
-      });
+      logger.warn('VSS extension not available', { error: error.message });
       this.vssEnabled = false;
     }
   }
 
   /**
-   * Rebuild the HNSW index (call after bulk inserts or purges).
+   * Load the VSS extension on first call, then cache the result.
+   * Called by memory.js / skillPrompt.js immediately before any
+   * array_cosine_distance() query.  Runs through _enqueue() so it is
+   * fully serialized with INSERTs from the screen monitor.
    */
-  async rebuildHnswIndex() {
-    if (!this.vssEnabled) return;
+  async ensureVssLoaded() {
+    if (this._vssLoaded) return;
     try {
-      await this.run('DROP INDEX IF EXISTS idx_memory_embedding_hnsw');
-      const result = await this.all(
-        'SELECT COUNT(*) as count FROM memory WHERE embedding IS NOT NULL'
-      );
-      const count = Number(result[0]?.count || 0);
-      if (count > 0) {
-        const startTime = Date.now();
-        await this.run(
-          'CREATE INDEX idx_memory_embedding_hnsw ON memory USING HNSW (embedding) WITH (metric = \'cosine\')'
-        );
-        logger.info('HNSW vector index rebuilt', { records: count, buildTimeMs: Date.now() - startTime });
-      }
+      await this.run('LOAD vss');
+      this._vssLoaded = true;
+      this.vssEnabled = true;
+      logger.info('VSS extension loaded (deferred, first search)');
     } catch (error) {
-      logger.error('Failed to rebuild HNSW index', { error: error.message });
+      logger.warn('VSS LOAD failed — search will use fallback', { error: error.message });
+      this.vssEnabled = false;
     }
   }
 
   /**
-   * Compact the HNSW index (prune deleted entries).
+   * No-op: the persistent HNSW index is intentionally absent from the memory
+   * table (see initVectorSearch for the full explanation). The transient
+   * in-memory HNSW used at search time is managed by memory.js directly.
+   */
+  async rebuildHnswIndex() {
+    // intentional no-op
+  }
+
+  /**
+   * No-op: no persistent HNSW index to compact (see initVectorSearch).
    */
   async compactHnswIndex() {
-    if (!this.vssEnabled) return;
-    try {
-      await this.run('PRAGMA hnsw_compact_index(\'idx_memory_embedding_hnsw\')');
-      logger.info('HNSW index compacted');
-    } catch (error) {
-      logger.warn('Failed to compact HNSW index', { error: error.message });
-    }
+    // intentional no-op
+  }
+
+  /**
+   * Serialize a raw DuckDB run call through the queue.
+   */
+  run(sql, ...params) {
+    return this._enqueue(() => this._run(sql, ...params));
+  }
+
+  /**
+   * Serialize a raw DuckDB all call through the queue.
+   */
+  all(sql, ...params) {
+    return this._enqueue(() => this._all(sql, ...params));
   }
 
   /**
@@ -937,6 +1000,31 @@ class DatabaseService {
       const results = await this.all(sql, ...params);
       return results;
     } catch (error) {
+      const errorMessage = error.message || '';
+      
+      // Detect DuckDB corruption errors and attempt recovery
+      if (errorMessage.includes('unique_ptr that is NULL') || 
+          errorMessage.includes('InternalException') ||
+          errorMessage.includes('database is locked') ||
+          errorMessage.includes('IO Error')) {
+        logger.error('Database corruption detected, attempting recovery', { sql, error: error.message });
+        
+        try {
+          // Close and reinitialize connection
+          await this.close();
+          this.isInitialized = false;
+          await this.initialize();
+          
+          // Retry the query once
+          const results = await this.all(sql, ...params);
+          logger.info('Database recovery successful, query succeeded');
+          return results;
+        } catch (recoveryError) {
+          logger.error('Database recovery failed', { error: recoveryError.message });
+          throw recoveryError;
+        }
+      }
+      
       logger.error('Database query failed', { sql, error: error.message });
       throw error;
     }
@@ -954,6 +1042,31 @@ class DatabaseService {
       await this.run(sql, ...params);
       return { success: true };
     } catch (error) {
+      const errorMessage = error.message || '';
+      
+      // Detect DuckDB corruption errors and attempt recovery
+      if (errorMessage.includes('unique_ptr that is NULL') || 
+          errorMessage.includes('InternalException') ||
+          errorMessage.includes('database is locked') ||
+          errorMessage.includes('IO Error')) {
+        logger.error('Database corruption detected in execute, attempting recovery', { sql, error: error.message });
+        
+        try {
+          // Close and reinitialize connection
+          await this.close();
+          this.isInitialized = false;
+          await this.initialize();
+          
+          // Retry the execution once
+          await this.run(sql, ...params);
+          logger.info('Database recovery successful, execute succeeded');
+          return { success: true };
+        } catch (recoveryError) {
+          logger.error('Database recovery failed in execute', { error: recoveryError.message });
+          throw recoveryError;
+        }
+      }
+      
       logger.error('Database execution failed', { sql, error: error.message });
       throw error;
     }
@@ -985,9 +1098,84 @@ class DatabaseService {
   }
 
   /**
+   * WAL checkpoint — merge WAL back into the main DB file.
+   * NEVER delete the WAL file manually while a DuckDB connection is open:
+   * DuckDB holds internal C++ pointers to the WAL and deleting it causes
+   * a NULL ptr dereference crash ("unique_ptr that is NULL").
+   * Only call CHECKPOINT and let DuckDB manage the WAL lifecycle itself.
+   */
+  async aggressiveWalCleanup() {
+    try {
+      const walPath = this.dbPath + '.wal';
+      if (fs.existsSync(walPath)) {
+        const stats = fs.statSync(walPath);
+        const walSizeMB = stats.size / (1024 * 1024);
+        const walAgeMinutes = (Date.now() - stats.mtime.getTime()) / (1000 * 60);
+
+        // Only checkpoint if WAL is > 1 MB or older than 5 minutes
+        if (walSizeMB > 1 || walAgeMinutes > 5) {
+          logger.info('WAL checkpoint triggered', {
+            walSizeMB: walSizeMB.toFixed(2),
+            walAgeMinutes: walAgeMinutes.toFixed(2)
+          });
+          // CHECKPOINT merges WAL into the main file — DuckDB then truncates
+          // the WAL internally. Do NOT call fs.unlinkSync on the WAL file.
+          await this.run('CHECKPOINT');
+          logger.info('WAL checkpoint complete');
+        }
+      }
+    } catch (cleanupError) {
+      logger.warn('WAL checkpoint failed', { error: cleanupError.message });
+    }
+  }
+
+  /**
+   * Start proactive health check interval.
+   * Runs a lightweight SELECT 1 ping every 2 minutes — just enough to detect
+   * a disconnected state early. No CHECKPOINT here: DuckDB auto-checkpoints
+   * and forcing it on a short interval races with concurrent INSERTs.
+   */
+  startHealthCheck() {
+    this.healthCheckInterval = setInterval(async () => {
+      try {
+        const health = await this.healthCheck();
+        if (health.status !== 'connected') {
+          logger.error('Proactive health check failed', { error: health.error });
+          try {
+            await this.close();
+            this.isInitialized = false;
+            await this.initialize();
+            logger.info('Proactive recovery succeeded');
+          } catch (recoveryError) {
+            logger.error('Proactive recovery failed', { error: recoveryError.message });
+          }
+        }
+      } catch (error) {
+        logger.error('Health check interval error', { error: error.message });
+      }
+    }, 120000); // Every 2 minutes — no forced CHECKPOINT
+    
+    logger.info('Proactive health check started (2min interval)');
+  }
+
+  /**
+   * Stop health check interval
+   */
+  stopHealthCheck() {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+      logger.info('Proactive health check stopped');
+    }
+  }
+
+  /**
    * Close database connection
    */
   async close() {
+    // Stop health check
+    this.stopHealthCheck();
+    
     if (this.connection) {
       try {
         // Checkpoint WAL to persist changes
@@ -1004,6 +1192,11 @@ class DatabaseService {
       this.db = null;
     }
     this.isInitialized = false;
+    // Reset the serial queue so re-initialization after recovery gets a clean slate
+    this._dbQueue = Promise.resolve();
+    // Reset VSS flag — new connection must re-load on next search
+    this._vssLoaded = false;
+    this.vssEnabled = false;
     logger.info('Database connection closed');
   }
 }

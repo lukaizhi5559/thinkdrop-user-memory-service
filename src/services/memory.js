@@ -9,10 +9,17 @@ import {
 } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 
+// Row threshold above which a transient in-memory HNSW is used instead of brute-force.
+const HNSW_THRESHOLD = 20000;
+// How long (ms) to reuse a cached transient HNSW before rebuilding.
+const HNSW_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 class MemoryService {
   constructor() {
     this.db = getDatabaseService();
     this.embeddings = getEmbeddingService();
+    // Transient in-memory HNSW cache (only used when row count >= HNSW_THRESHOLD)
+    this._hnswCache = null; // { db, connection, builtAt, rowCount }
   }
 
   /**
@@ -207,31 +214,61 @@ class MemoryService {
         ? `WHERE ${whereConditions.join(' AND ')} AND embedding IS NOT NULL` 
         : 'WHERE embedding IS NOT NULL';
 
-      // Search with similarity using array_cosine_distance (HNSW-accelerated when vss is loaded)
-      // cosine_distance = 0 means identical, 2 means opposite; similarity = 1 - distance
-      const embeddingValues = queryEmbedding.map(v => v.toString()).join(',');
-      const queryVector = `[${embeddingValues}]::FLOAT[384]`;
-      const sql = `
-        SELECT 
-          id,
-          type,
-          source_text,
-          metadata,
-          screenshot,
-          extracted_text,
-          created_at,
-          (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
-        FROM memory
-        ${whereClause}
-        ORDER BY array_cosine_distance(embedding, ${queryVector})
-        LIMIT ${limit}
-        OFFSET ${offset}
-      `;
+      // Ensure VSS is loaded before issuing any array_cosine_distance() query.
+      // VSS is intentionally NOT loaded at startup (see database.js initVectorSearch).
+      // This call goes through _enqueue() so it is fully serialized — no screen
+      // monitor INSERT can be in flight at the same time.  After the first call
+      // this is a fast boolean check (no DB round-trip).
+      await this.db.ensureVssLoaded();
 
-      console.log('🔍 [MEMORY-SEARCH] Executing search query...');
-      
+      // Threshold-based search:
+      //   < HNSW_THRESHOLD rows → brute-force array_cosine_distance() (~25–55 ms)
+      //   >= HNSW_THRESHOLD rows → transient in-memory HNSW (cached 5 min, never on persistent DB)
+      const embeddingValues = queryEmbedding.map(v => v.toString()).join(',');
+      const queryVector = `list_value(${embeddingValues})::FLOAT[384]`;
+
+      // Count rows eligible for this search (whereClause already includes embedding IS NOT NULL)
+      const eligibleCountResult = await this.db.query(
+        `SELECT COUNT(*) as count FROM memory ${whereClause}`
+      );
+      const eligibleCount = Number(eligibleCountResult[0]?.count || 0);
+
+      console.log(`🔍 [MEMORY-SEARCH] Eligible rows: ${eligibleCount}, threshold: ${HNSW_THRESHOLD}`);
+
+      let results;
       const dbStart = Date.now();
-      const results = await this.db.query(sql);
+
+      if (eligibleCount < HNSW_THRESHOLD) {
+        // ── Brute-force path ──────────────────────────────────────────────────
+        console.log('🔍 [MEMORY-SEARCH] Using brute-force search');
+        const sql = `
+          SELECT 
+            id,
+            type,
+            source_text,
+            metadata,
+            screenshot,
+            extracted_text,
+            created_at,
+            (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
+          FROM memory
+          ${whereClause}
+          ORDER BY array_cosine_distance(embedding, ${queryVector})
+          LIMIT ${limit}
+          OFFSET ${offset}
+        `;
+        results = await this.db.query(sql);
+      } else {
+        // ── Transient in-memory HNSW path ─────────────────────────────────────
+        // Build (or reuse) a cached in-memory DuckDB instance with HNSW index.
+        // This is completely separate from the persistent DB so CHECKPOINT on
+        // the main DB never touches the HNSW graph.
+        console.log('🔍 [MEMORY-SEARCH] Using transient in-memory HNSW');
+        results = await this._searchWithTransientHnsw(
+          queryVector, whereClause, limit, offset
+        );
+      }
+
       timings.dbQuery = Date.now() - dbStart;
 
       // Filter by minimum similarity and fetch entities for each result
@@ -329,6 +366,110 @@ class MemoryService {
       logger.error('Memory search failed', { error: error.message });
       throw error;
     }
+  }
+
+  /**
+   * Build (or reuse cached) a transient in-memory DuckDB instance with HNSW.
+   * Called only when row count >= HNSW_THRESHOLD.
+   * The in-memory DB is entirely separate from the persistent DB so CHECKPOINT
+   * on the main DB never touches the HNSW graph — eliminating the crash path.
+   */
+  async _searchWithTransientHnsw(queryVector, whereClause, limit, offset) {
+    const duckdbModule = await import('duckdb');
+    const duckdb = duckdbModule.default;
+
+    const now = Date.now();
+    const totalCountResult = await this.db.query(
+      'SELECT COUNT(*) as count FROM memory WHERE embedding IS NOT NULL'
+    );
+    const rowCount = Number(totalCountResult[0]?.count || 0);
+
+    const cacheValid = this._hnswCache &&
+      (now - this._hnswCache.builtAt) < HNSW_CACHE_TTL_MS &&
+      this._hnswCache.rowCount === rowCount;
+
+    if (!cacheValid) {
+      if (this._hnswCache) {
+        try { this._hnswCache.connection.close(); } catch (e) { /* ignore */ }
+        try { this._hnswCache.db.close(); } catch (e) { /* ignore */ }
+        this._hnswCache = null;
+      }
+
+      logger.info('Building transient in-memory HNSW index', { rowCount });
+      const buildStart = Date.now();
+
+      const memDb = new duckdb.Database(':memory:');
+      const memConn = memDb.connect();
+      const memRun = (sql) => new Promise((res, rej) =>
+        memConn.run(sql, (e) => (e ? rej(e) : res()))
+      );
+      const memAll = (sql) => new Promise((res, rej) =>
+        memConn.all(sql, (e, r) => (e ? rej(e) : res(r)))
+      );
+
+      await memRun('LOAD vss');
+      await memRun('CREATE TABLE mem_search (row_id TEXT, embedding FLOAT[384])');
+
+      const rows = await this.db.query(
+        'SELECT id, embedding FROM memory WHERE embedding IS NOT NULL'
+      );
+
+      if (rows.length > 0) {
+        const batchSize = 500;
+        for (let i = 0; i < rows.length; i += batchSize) {
+          const batch = rows.slice(i, i + batchSize);
+          const vals = batch.map((r) => {
+            const floats = Array.isArray(r.embedding)
+              ? r.embedding
+              : Object.values(r.embedding);
+            const safeId = r.id.replace(/'/g, '\'\'');
+            return `('${safeId}', list_value(${floats.join(',')}))`;
+          }).join(',\n');
+          await memRun(`INSERT INTO mem_search VALUES ${vals}`);
+        }
+        await memRun(
+          'CREATE INDEX mem_hnsw ON mem_search USING HNSW (embedding) WITH (metric=\'cosine\')'
+        );
+      }
+
+      this._hnswCache = {
+        db: memDb,
+        connection: memConn,
+        all: memAll,
+        builtAt: now,
+        rowCount
+      };
+      logger.info('Transient HNSW built', {
+        rowCount,
+        buildTimeMs: Date.now() - buildStart
+      });
+    }
+
+    const memAll = this._hnswCache.all;
+
+    const hnswSql = `
+      SELECT row_id as id, (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
+      FROM mem_search
+      ORDER BY array_cosine_distance(embedding, ${queryVector})
+      LIMIT ${limit + offset}
+    `;
+    const hnswResults = await memAll(hnswSql);
+    const pagedIds = hnswResults.slice(offset, offset + limit).map((r) => r.id);
+    const simMap = Object.fromEntries(hnswResults.map((r) => [r.id, r.similarity]));
+
+    if (pagedIds.length === 0) return [];
+
+    const idList = pagedIds.map((id) => `'${id.replace(/'/g, '\'\'')}'`).join(',');
+    const fullRows = await this.db.query(`
+      SELECT id, type, source_text, metadata, screenshot, extracted_text, created_at
+      FROM memory
+      WHERE id IN (${idList})
+    `);
+
+    const rowById = Object.fromEntries(fullRows.map((r) => [r.id, r]));
+    return pagedIds
+      .filter((id) => rowById[id])
+      .map((id) => ({ ...rowById[id], similarity: simMap[id] }));
   }
 
   /**
@@ -615,7 +756,7 @@ class MemoryService {
    * @param {string} options.userId - User ID filter
    * @returns {Object|null} Recent OCR data or null if none fresh enough
    */
-  async getRecentOcr(options = {}, context = {}) {
+  async getRecentOcr(options = {}) {
     try {
       // Screen captures are stored by the monitor under MONITOR_USER_ID (default: 'local_user')
       const userId = options.userId || process.env.MONITOR_USER_ID || 'local_user';

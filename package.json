@@ -25,6 +25,7 @@
   "author": "Thinkdrop AI Team",
   "license": "MIT",
   "dependencies": {
+    "@thinkdrop/agents-db": "*",
     "@xenova/transformers": "2.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",

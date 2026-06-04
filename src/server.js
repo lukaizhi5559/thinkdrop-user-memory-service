@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getDatabaseService } from './services/database.js';
@@ -326,6 +327,64 @@ async function startServer() {
   }
 }
 
+// Global error handlers to catch native crashes (e.g., DuckDB C++ exceptions)
+let crashCount = 0;
+const crashLogPath = path.join(__dirname, '..', '..', 'data', '.crash_count');
+
+// Load crash count on startup
+try {
+  if (fs.existsSync(crashLogPath)) {
+    const data = fs.readFileSync(crashLogPath, 'utf8');
+    const parsed = JSON.parse(data);
+    // Reset if last crash was > 10 minutes ago
+    if (parsed.timestamp && (Date.now() - parsed.timestamp > 10 * 60 * 1000)) {
+      crashCount = 0;
+    } else {
+      crashCount = parsed.count || 0;
+    }
+  }
+} catch (e) {
+  crashCount = 0;
+}
+
+process.on('uncaughtException', async (error) => {
+  crashCount++;
+  logger.error('Uncaught Exception (native crash detected)', {
+    error: error.message,
+    stack: error.stack,
+    crashCount,
+    isDuckDB: error.message?.includes('unique_ptr') || error.message?.includes('InternalException')
+  });
+  
+  // Persist crash count
+  try {
+    fs.writeFileSync(crashLogPath, JSON.stringify({ count: crashCount, timestamp: Date.now() }));
+  } catch (e) {
+    // Ignore
+  }
+  
+  // Attempt to close database gracefully
+  try {
+    const db = getDatabaseService();
+    await db.close();
+    logger.info('Database closed gracefully after uncaught exception');
+  } catch (closeError) {
+    logger.error('Failed to close database after uncaught exception', { error: closeError.message });
+  }
+  
+  // Exit with error code
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Promise Rejection', {
+    reason: reason?.message || reason,
+    stack: reason?.stack,
+    isDuckDB: reason?.message?.includes('unique_ptr') || reason?.message?.includes('InternalException')
+  });
+  // Don't exit - let the process continue
+});
+
 // Graceful shutdown
 async function gracefulShutdown(signal) {
   logger.info(`${signal} received, shutting down gracefully...`);
@@ -342,6 +401,17 @@ async function gracefulShutdown(signal) {
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Before exit - cleanup
+process.on('beforeExit', async () => {
+  logger.info('Process beforeExit event - cleaning up...');
+  try {
+    const db = getDatabaseService();
+    await db.close();
+  } catch (e) {
+    // Ignore
+  }
+});
 
 // Start the server only if not in test mode
 if (process.env.NODE_ENV !== 'test') {
