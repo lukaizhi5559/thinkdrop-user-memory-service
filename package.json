@@ -25,11 +25,9 @@
   "author": "Thinkdrop AI Team",
   "license": "MIT",
   "dependencies": {
-    "@thinkdrop/agents-db": "*",
     "@xenova/transformers": "2.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",
-    "duckdb": "latest",
     "express": "^4.18.0",
     "get-windows": "^9.2.3",
     "helmet": "^7.0.0",
