@@ -792,6 +792,7 @@ class MemoryService {
         sourceText: row.source_text,
         appName: metadata.appName || 'unknown',
         windowTitle: metadata.windowTitle || 'unknown',
+        category: metadata.category || 'other',
         url: metadata.url || null,
         files: metadata.files || [],
         codeSnippets: metadata.codeSnippets || [],

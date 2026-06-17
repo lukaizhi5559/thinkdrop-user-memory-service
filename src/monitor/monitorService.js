@@ -6,6 +6,21 @@ import { getEmbeddingService } from '../services/embeddings.js';
 import { generateMemoryId } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 
+const KNOWN_APPS = {
+  'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
+  'Microsoft Edge': 'browser', 'Brave Browser': 'browser',
+  'Visual Studio Code': 'editor', 'Code': 'editor', 'Cursor': 'editor',
+  'Windsurf': 'editor', 'Zed': 'editor', 'Sublime Text': 'editor',
+  'TextEdit': 'editor', 'Devin': 'editor',
+  'Slack': 'chat', 'Discord': 'chat', 'Microsoft Teams': 'chat',
+  'Telegram': 'chat', 'WhatsApp': 'chat', 'Messages': 'chat',
+  'Figma': 'design', 'Adobe Photoshop': 'design', 'Adobe Illustrator': 'design',
+  'Sketch': 'design',
+  'Terminal': 'terminal', 'iTerm': 'terminal', 'iTerm2': 'terminal',
+  'Warp': 'terminal', 'Hyper': 'terminal',
+  'Mail': 'email', 'Microsoft Outlook': 'email', 'Spark': 'email'
+};
+
 class MonitorService {
   constructor() {
     this.isRunning = false;
@@ -21,6 +36,7 @@ class MonitorService {
     this.ocr = getOCRService();
     this.db = getDatabaseService();
     this.embeddings = getEmbeddingService();
+    this._watchModes = new Map();
   }
 
   /**
@@ -105,6 +121,9 @@ class MonitorService {
 
       // Step 3: Check if window context changed
       const titleChanged = appName !== this.lastAppName || windowTitle !== this.lastWindowTitle;
+      if (titleChanged && appName) {
+        this._enqueueAppEnrichment(appName, windowTitle);
+      }
       this.lastAppName = appName;
       this.lastWindowTitle = windowTitle;
 
@@ -151,6 +170,11 @@ class MonitorService {
       await this.storeCapture(appName, windowTitle, ocrResult, url);
       this.captureCount++;
 
+      // Step 7: Check active watch modes — fire callbacks if new content detected
+      if (this._watchModes.size > 0) {
+        this._checkWatchModes(appName, ocrResult.text).catch(() => {});
+      }
+
       logger.info('Screen capture stored', {
         appName,
         windowTitle: windowTitle.substring(0, 80),
@@ -167,9 +191,120 @@ class MonitorService {
   }
 
   /**
-   * Store a screen capture as a memory record.
-   * Processes raw OCR through cleanup pipeline before storing.
+   * Check all active watch modes for this appName.
+   * Compares current OCR to each mode's baseline — fires onNewContent if new lines detected.
+   * Runs LLM-free: just string comparison. LLM is in the onNewContent callback in app.agent.
    */
+  _checkWatchModes(appName, currentText) {
+    const promises = [];
+    for (const [sessionId, watchSession] of this._watchModes.entries()) {
+      if (watchSession.appName !== appName) continue;
+
+      const baselineLines = new Set((watchSession.baselineOCR || '').split('\n').map(l => l.trim()).filter(Boolean));
+      const currentLines = currentText.split('\n').map(l => l.trim()).filter(Boolean);
+      const newLines = currentLines.filter(line => line.length > 5 && !baselineLines.has(line));
+
+      if (newLines.length > 0) {
+        logger.info(`[monitorService] watchMode ${sessionId}: ${newLines.length} new line(s) detected for ${appName}`);
+        watchSession.baselineOCR = currentText;
+        if (typeof watchSession.onNewContent === 'function') {
+          promises.push(
+            Promise.resolve(watchSession.onNewContent({ text: currentText, newLines })).catch(err => {
+              logger.error(`[monitorService] watchMode onNewContent error: ${err.message}`);
+            })
+          );
+        }
+      }
+    }
+    return Promise.all(promises);
+  }
+
+  /**
+   * Activate a watch mode session.
+   * Hooks into the existing monitorService tick — no separate polling loop.
+   * @param {Object} opts
+   * @param {string} opts.sessionId       - Unique ID for this watch session
+   * @param {string} opts.appName         - Only fire for this app
+   * @param {string} opts.baselineOCR     - Snapshot of screen BEFORE we start watching
+   * @param {string} [opts.stopKeyword]   - If found in new content, call onNewContent with DONE hint
+   * @param {number} [opts.maxWaitMs]     - Timeout in ms (default 5 min)
+   * @param {number} [opts.autoScrollMs]  - Interval for gentle scroll-down (default 15s). Pass 0 to disable.
+   * @param {Object} [opts.mainRegion]    - { centerX, centerY } for auto-scroll mouse position
+   * @param {Function} opts.onNewContent  - Callback: ({ text, newLines }) => void. LLM call happens here.
+   * @param {Function} [opts.onTimeout]   - Callback fired when maxWaitMs elapses with no DONE
+   */
+  activateWatchMode({ sessionId, appName, baselineOCR, stopKeyword, maxWaitMs = 300000, autoScrollMs = 15000, mainRegion, onNewContent, onTimeout }) {
+    if (this._watchModes.has(sessionId)) {
+      logger.warn(`[monitorService] watchMode ${sessionId} already active — deactivating old one first`);
+      this.deactivateWatchMode(sessionId);
+    }
+
+    const session = {
+      sessionId,
+      appName,
+      baselineOCR: baselineOCR || '',
+      stopKeyword: stopKeyword || null,
+      onNewContent,
+      onTimeout,
+      startedAt: Date.now(),
+      autoScrollInterval: null,
+      timeoutHandle: null
+    };
+
+    if (maxWaitMs > 0) {
+      session.timeoutHandle = setTimeout(() => {
+        logger.info(`[monitorService] watchMode ${sessionId} timed out after ${maxWaitMs}ms`);
+        this.deactivateWatchMode(sessionId);
+        if (typeof onTimeout === 'function') onTimeout();
+      }, maxWaitMs);
+    }
+
+    if (autoScrollMs > 0 && mainRegion) {
+      session.autoScrollInterval = setInterval(async () => {
+        try {
+          const nut = require('@nut-tree-fork/nut-js');
+          await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
+          await new Promise(r => setTimeout(r, 200));
+          await nut.mouse.scrollDown(2);
+          logger.debug(`[monitorService] watchMode ${sessionId}: auto-scroll down 2 units`);
+        } catch (error) {
+          console.log('Error:', error);
+        }
+      }, autoScrollMs);
+    }
+
+    this._watchModes.set(sessionId, session);
+    logger.info(`[monitorService] watchMode activated: ${sessionId} for ${appName} (maxWait: ${maxWaitMs}ms, autoScroll: ${autoScrollMs}ms)`);
+  }
+
+  /**
+   * Deactivate a watch mode session and clean up timers.
+   * @param {string} sessionId
+   */
+  deactivateWatchMode(sessionId) {
+    const session = this._watchModes.get(sessionId);
+    if (!session) return;
+
+    if (session.timeoutHandle) clearTimeout(session.timeoutHandle);
+    if (session.autoScrollInterval) clearInterval(session.autoScrollInterval);
+
+    this._watchModes.delete(sessionId);
+    logger.info(`[monitorService] watchMode deactivated: ${sessionId}`);
+  }
+
+  /**
+   * Fire-and-forget background enrichment trigger.
+   * Called on app switch to warm boundary + shortcut caches in app.agent.
+   */
+  _enqueueAppEnrichment(appName, windowTitle) {
+    const COMMAND_SERVICE_PORT = process.env.COMMAND_SERVICE_PORT || '3007';
+    fetch(`http://127.0.0.1:${COMMAND_SERVICE_PORT}/skill/app.agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'enrich_app_context', appName, windowTitle, background: true })
+    }).catch(() => {});
+  }
+
   async storeCapture(appName, windowTitle, ocrResult, url = null) {
     const memoryId = generateMemoryId();
     const userId = process.env.MONITOR_USER_ID || 'local_user';
@@ -185,9 +320,11 @@ class MonitorService {
     const embeddingValues = embedding.map(v => v.toString()).join(',');
 
     // Build metadata with extracted files, code snippets, and OCR stats
+    const category = KNOWN_APPS[appName] || 'other';
     const metadata = JSON.stringify({
       appName,
       windowTitle,
+      category,
       ...(url ? { url } : {}),
       ocrConfidence: ocrResult.confidence,
       ocrRawLength: ocrResult.text.length,
