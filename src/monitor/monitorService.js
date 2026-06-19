@@ -5,6 +5,7 @@ import { getDatabaseService } from '../services/database.js';
 import { getEmbeddingService } from '../services/embeddings.js';
 import { generateMemoryId } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
+import { PNG } from 'pngjs';
 
 const KNOWN_APPS = {
   'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
@@ -37,6 +38,10 @@ class MonitorService {
     this.db = getDatabaseService();
     this.embeddings = getEmbeddingService();
     this._watchModes = new Map();
+    // Phase 2: Track screen dimensions for resize detection
+    this.lastScreenWidth = 0;
+    this.lastScreenHeight = 0;
+    this.BOUNDARY_INVALIDATION_THRESHOLD = 0.30; // 30% pixel diff triggers cache invalidation
   }
 
   /**
@@ -122,6 +127,10 @@ class MonitorService {
       // Step 3: Check if window context changed
       const titleChanged = appName !== this.lastAppName || windowTitle !== this.lastWindowTitle;
       if (titleChanged && appName) {
+        // Phase 2: Invalidate previous app's boundary cache before switching
+        if (this.lastAppName) {
+          this._invalidateBoundaryCache(this.lastAppName, this.lastWindowTitle);
+        }
         this._enqueueAppEnrichment(appName, windowTitle);
       }
       this.lastAppName = appName;
@@ -136,6 +145,8 @@ class MonitorService {
           this.skipCount++;
           return;
         }
+        // Phase 2: Check for screen resize
+        this._checkScreenResize(screenshotBuffer, appName, windowTitle);
         // Update diff baseline for next same-window tick
         await this.screenCapture.computeDiff(screenshotBuffer);
       } else {
@@ -148,7 +159,15 @@ class MonitorService {
           return;
         }
         screenshotBuffer = buffer;
+        // Phase 2: Check for screen resize
+        this._checkScreenResize(screenshotBuffer, appName, windowTitle);
         logger.debug('Pixel diff detected', { diffRatio: diffRatio.toFixed(3), appName, windowTitle });
+
+        // Phase 2: Invalidate boundary cache if pixel diff > 30% (major visual change)
+        if (diffRatio > this.BOUNDARY_INVALIDATION_THRESHOLD) {
+          logger.info('[monitorService] Pixel diff >30%, invalidating boundary cache', { appName, windowTitle, diffRatio: diffRatio.toFixed(3) });
+          this._invalidateBoundaryCache(appName, windowTitle);
+        }
       }
 
       // Step 5: Run OCR
@@ -159,11 +178,16 @@ class MonitorService {
         return;
       }
 
-      // Step 5b: Text hash dedup
+      // Step 5b: Text hash dedup — bypassed on app switch so the new app is
+      // immediately anchored in the DB even if screen content hasn't changed.
       const { isDifferent } = this.ocr.checkTextChanged(ocrResult.text);
-      if (!isDifferent) {
+      if (!isDifferent && !titleChanged) {
         this.skipCount++;
         return;
+      }
+
+      if (!isDifferent && titleChanged) {
+        logger.info(`[monitorService] App switched to "${appName}" — bypassing text-hash dedup to anchor new app in DB`);
       }
 
       // Step 6: Generate embedding and store
@@ -290,6 +314,48 @@ class MonitorService {
 
     this._watchModes.delete(sessionId);
     logger.info(`[monitorService] watchMode deactivated: ${sessionId}`);
+  }
+
+  /**
+   * Invalidate boundary cache for a specific app/window.
+   * Called on app switch, resize, or major visual change (>30% pixel diff).
+   * Phase 2: Cache invalidation triggers for boundary layout freshness.
+   */
+  _invalidateBoundaryCache(appName, windowTitle) {
+    if (!appName) return;
+    const cacheKey = `${appName.toLowerCase().replace(/\s+/g, '_')}_${(windowTitle || 'default').toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+    // Fire-and-forget invalidation request to command-service
+    const COMMAND_SERVICE_PORT = process.env.COMMAND_SERVICE_PORT || '3007';
+    fetch(`http://127.0.0.1:${COMMAND_SERVICE_PORT}/skill/app.agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'clear_boundary_cache', appName, windowTitle })
+    }).catch(() => {});
+    logger.info(`[monitorService] Boundary cache invalidation triggered: ${cacheKey}`);
+  }
+
+  /**
+   * Check for screen resize and invalidate boundary cache if dimensions changed.
+   * Phase 2: Triggers when screen resize > 100px in either dimension.
+   */
+  _checkScreenResize(buffer, appName, windowTitle) {
+    try {
+      const png = PNG.sync.read(buffer);
+      const { width, height } = png;
+      if (this.lastScreenWidth === 0) {
+        this.lastScreenWidth = width;
+        this.lastScreenHeight = height;
+        return;
+      }
+      const wDiff = Math.abs(width - this.lastScreenWidth);
+      const hDiff = Math.abs(height - this.lastScreenHeight);
+      if (wDiff > 100 || hDiff > 100) {
+        logger.info('[monitorService] Screen resize detected', { appName, old: `${this.lastScreenWidth}x${this.lastScreenHeight}`, new: `${width}x${height}` });
+        this._invalidateBoundaryCache(appName, windowTitle);
+      }
+      this.lastScreenWidth = width;
+      this.lastScreenHeight = height;
+    } catch (_) { /* non-critical — PNG parse errors don't affect monitor operation */ }
   }
 
   /**

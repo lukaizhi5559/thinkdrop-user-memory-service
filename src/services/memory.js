@@ -760,7 +760,14 @@ class MemoryService {
     try {
       // Screen captures are stored by the monitor under MONITOR_USER_ID (default: 'local_user')
       const userId = options.userId || process.env.MONITOR_USER_ID || 'local_user';
-      const maxAgeSeconds = options.maxAgeSeconds || 10;
+      const maxAgeSeconds = options.maxAgeSeconds || 3;
+      const appName = options.appName || null;
+
+      // When appName is provided, filter by it so we never return a different app's
+      // stale capture (e.g. Devin capture while Chrome is active).
+      const appNameClause = appName
+        ? `AND json_extract_string(metadata, '$.appName') = '${appName.replace(/'/g, '\'\'')}'`
+        : '';
 
       const sql = `
         SELECT 
@@ -773,6 +780,7 @@ class MemoryService {
         WHERE type = 'screen_capture'
           AND user_id = '${userId}'
           AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeSeconds}' SECOND
+          ${appNameClause}
         ORDER BY created_at DESC
         LIMIT 1
       `;

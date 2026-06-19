@@ -25,7 +25,8 @@ router.post('/memory.getRecentOcr', async (req, res, next) => {
     const { payload = {}, context, requestId } = req.body;
 
     const result = await memoryService.getRecentOcr({
-      maxAgeSeconds: payload.maxAgeSeconds || 10
+      maxAgeSeconds: payload.maxAgeSeconds || 3,
+      appName: payload.appName || null
     }, context);
 
     res.json(formatMCPResponse(
