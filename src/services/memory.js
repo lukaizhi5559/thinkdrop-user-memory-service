@@ -762,11 +762,19 @@ class MemoryService {
       const userId = options.userId || process.env.MONITOR_USER_ID || 'local_user';
       const maxAgeSeconds = options.maxAgeSeconds || 3;
       const appName = options.appName || null;
+      // preferAppName: when set, sort captures from this app first within the time window.
+      // Used to prefer the app the user was looking at before opening the ThinkDrop overlay,
+      // even if another app was captured more recently (e.g. Devin captured 8s after Chrome).
+      const preferAppName = options.preferAppName || null;
 
       // When appName is provided, filter by it so we never return a different app's
       // stale capture (e.g. Devin capture while Chrome is active).
       const appNameClause = appName
         ? `AND json_extract_string(metadata, '$.appName') = '${appName.replace(/'/g, '\'\'')}'`
+        : '';
+
+      const preferClause = preferAppName
+        ? `CASE WHEN json_extract_string(metadata, '$.appName') = '${preferAppName.replace(/'/g, '\'\'')}' THEN 0 ELSE 1 END,`
         : '';
 
       const sql = `
@@ -781,7 +789,7 @@ class MemoryService {
           AND user_id = '${userId}'
           AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeSeconds}' SECOND
           ${appNameClause}
-        ORDER BY created_at DESC
+        ORDER BY ${preferClause} created_at DESC
         LIMIT 1
       `;
 

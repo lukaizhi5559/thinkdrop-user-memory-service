@@ -6,6 +6,9 @@ import { getEmbeddingService } from '../services/embeddings.js';
 import { generateMemoryId } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 import { PNG } from 'pngjs';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 const KNOWN_APPS = {
   'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
@@ -38,6 +41,9 @@ class MonitorService {
     this.db = getDatabaseService();
     this.embeddings = getEmbeddingService();
     this._watchModes = new Map();
+    // The last non-overlay app the user was in before switching to ThinkDrop.
+    // Used by getRecentOcr to prefer captures from the app the user was actually looking at.
+    this.lastNonOverlayApp = null;
     // Phase 2: Track screen dimensions for resize detection
     this.lastScreenWidth = 0;
     this.lastScreenHeight = 0;
@@ -55,6 +61,41 @@ class MonitorService {
 
     // Initialize OCR worker
     await this.ocr.initialize();
+
+    // Cold-start: restore lastNonOverlayApp so getRecentOcr works correctly from the
+    // very first request after a service restart.
+    // Priority: 1) persisted state file (written when ThinkDrop overlay took focus),
+    //           2) DB query for most recent non-overlay capture.
+    const _stateFile = path.join(os.homedir(), '.thinkdrop', 'monitor-state.json');
+    try {
+      if (fs.existsSync(_stateFile)) {
+        const _saved = JSON.parse(fs.readFileSync(_stateFile, 'utf8'));
+        if (_saved?.lastNonOverlayApp) {
+          this.lastNonOverlayApp = _saved.lastNonOverlayApp;
+          logger.info(`[monitorService] Cold-start: restored lastNonOverlayApp = "${this.lastNonOverlayApp}" (from state file)`);
+        }
+      }
+    } catch (_) { /* state file unreadable — fall through to DB */ }
+    // DB fallback if state file had nothing
+    if (!this.lastNonOverlayApp) {
+      try {
+        const seedRows = await this.db.query(`
+          SELECT json_extract_string(metadata, '$.appName') as appName
+          FROM memory
+          WHERE type = 'screen_capture'
+            AND json_extract_string(metadata, '$.appName') NOT IN ('Electron', 'ThinkDrop', 'unknown')
+            AND json_extract_string(metadata, '$.appName') IS NOT NULL
+          ORDER BY created_at DESC
+          LIMIT 1
+        `);
+        if (seedRows?.length > 0 && seedRows[0].appName) {
+          this.lastNonOverlayApp = seedRows[0].appName;
+          logger.info(`[monitorService] Cold-start: seeded lastNonOverlayApp = "${this.lastNonOverlayApp}" (from DB)`);
+        }
+      } catch (seedErr) {
+        logger.debug(`[monitorService] Cold-start DB seed skipped: ${seedErr.message}`);
+      }
+    }
 
     this.isRunning = true;
     logger.info('Screen monitor started', {
@@ -120,6 +161,18 @@ class MonitorService {
       // Skip if the active app is the ThinkDrop overlay itself
       const SKIP_APPS = ['Electron', 'ThinkDrop'];
       if (SKIP_APPS.some(skip => appName?.includes(skip))) {
+        // Record the last real (non-overlay) app so getRecentOcr can prefer it.
+        // This captures the app the user was looking at before opening ThinkDrop.
+        if (this.lastAppName && !SKIP_APPS.some(s => this.lastAppName?.includes(s))) {
+          this.lastNonOverlayApp = this.lastAppName;
+          // Persist to disk so it survives service restarts.
+          try {
+            const _stateDir = path.join(os.homedir(), '.thinkdrop');
+            if (!fs.existsSync(_stateDir)) fs.mkdirSync(_stateDir, { recursive: true });
+            fs.writeFileSync(path.join(_stateDir, 'monitor-state.json'),
+              JSON.stringify({ lastNonOverlayApp: this.lastNonOverlayApp, ts: new Date().toISOString() }));
+          } catch (_) { /* non-fatal — persist best-effort */ }
+        }
         this.skipCount++;
         return;
       }
