@@ -788,6 +788,7 @@ class MemoryService {
         WHERE type = 'screen_capture'
           AND user_id = '${userId}'
           AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeSeconds}' SECOND
+          AND json_extract_string(metadata, '$.overlayTainted') IS NULL
           ${appNameClause}
         ORDER BY ${preferClause} created_at DESC
         LIMIT 1

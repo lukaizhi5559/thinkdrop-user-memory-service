@@ -25,6 +25,39 @@ const KNOWN_APPS = {
   'Mail': 'email', 'Microsoft Outlook': 'email', 'Spark': 'email'
 };
 
+// ── Overlay detection ────────────────────────────────────────────────────────
+// The ThinkDrop overlay is an always-on-top Electron window. When the monitor
+// captures the whole screen, OCR reads the overlay text and misidentifies the
+// active app. These phrases are unique to the overlay UI and are used to flag
+// tainted captures so they can be excluded from context queries.
+
+const OVERLAY_STRONG_PHRASES = [
+  'Ask or Drag-Drop anything here',
+  'Copilot Screen Assistant',
+  'ThinkDrop',
+  'You just switched to the',
+];
+
+function isOverlayTainted(text) {
+  const lower = (text || '').toLowerCase();
+  if (!lower) return false;
+
+  // Strong, unambiguous overlay phrases
+  for (const phrase of OVERLAY_STRONG_PHRASES) {
+    if (lower.includes(phrase.toLowerCase())) return true;
+  }
+
+  // The two overlay tabs appear together
+  const hasResults = lower.includes('results');
+  const hasAgents = lower.includes('agents');
+  if (hasResults && hasAgents) return true;
+
+  // Electron identifier appears alongside one of the overlay tabs
+  if (lower.includes('electron') && (hasResults || hasAgents)) return true;
+
+  return false;
+}
+
 class MonitorService {
   constructor() {
     this.isRunning = false;
@@ -85,6 +118,7 @@ class MonitorService {
           WHERE type = 'screen_capture'
             AND json_extract_string(metadata, '$.appName') NOT IN ('Electron', 'ThinkDrop', 'unknown')
             AND json_extract_string(metadata, '$.appName') IS NOT NULL
+            AND json_extract_string(metadata, '$.overlayTainted') IS NULL
           ORDER BY created_at DESC
           LIMIT 1
         `);
@@ -114,6 +148,10 @@ class MonitorService {
         this.errorCount++;
       });
     }, this.captureInterval);
+
+    // Run one-time migration to flag any existing overlay-tainted captures.
+    // Fire-and-forget — it should not block the monitor loop.
+    this.runOverlayTaintMigration().catch(() => {});
   }
 
   /**
@@ -438,6 +476,12 @@ class MonitorService {
     const embedding = await this.embeddings.generateEmbedding(embeddingText);
     const embeddingValues = embedding.map(v => v.toString()).join(',');
 
+    // Detect whether the captured image contains the ThinkDrop overlay
+    const overlayTainted = isOverlayTainted(processed.filteredText) || isOverlayTainted(ocrResult.text);
+    if (overlayTainted) {
+      logger.info('[monitorService] Overlay detected in capture — flagging as tainted', { appName, windowTitle });
+    }
+
     // Build metadata with extracted files, code snippets, and OCR stats
     const category = KNOWN_APPS[appName] || 'other';
     const metadata = JSON.stringify({
@@ -450,7 +494,8 @@ class MonitorService {
       cleanedLength: processed.filteredText.length,
       files: processed.files,
       codeSnippets: processed.codeSnippets,
-      capturedAt: new Date().toISOString()
+      capturedAt: new Date().toISOString(),
+      ...(overlayTainted ? { overlayTainted: true } : {})
     });
 
     // source_text = cleaned text for embedding/search
@@ -499,6 +544,50 @@ class MonitorService {
         )
       `;
       await this.db.execute(entitySql);
+    }
+  }
+
+  /**
+   * One-time startup migration: flag existing screen captures that contain the
+   * ThinkDrop overlay so they are excluded from getRecentOcr and context queries.
+   * Idempotent — only updates rows where overlayTainted is not already set.
+   */
+  async runOverlayTaintMigration() {
+    if (this._overlayTaintMigrationDone) return;
+    this._overlayTaintMigrationDone = true;
+
+    try {
+      // Find candidate rows that are not already flagged
+      const candidates = await this.db.query(`
+        SELECT id, metadata, extracted_text, source_text
+        FROM memory
+        WHERE type = 'screen_capture'
+          AND json_extract_string(metadata, '$.overlayTainted') IS NULL
+      `);
+
+      let updated = 0;
+      for (const row of candidates || []) {
+        const text = row.extracted_text || row.source_text || '';
+        if (isOverlayTainted(text)) {
+          const metadata = JSON.parse(row.metadata || '{}');
+          metadata.overlayTainted = true;
+          const safeMetadata = JSON.stringify(metadata).replace(/'/g, '\'\'');
+          await this.db.execute(`
+            UPDATE memory
+            SET metadata = '${safeMetadata}'
+            WHERE id = '${row.id.replace(/'/g, '\'\'')}'
+          `);
+          updated++;
+        }
+      }
+
+      if (updated > 0) {
+        logger.info('[monitorService] Overlay taint migration completed', { updatedRows: updated });
+      } else {
+        logger.info('[monitorService] Overlay taint migration: no rows to update');
+      }
+    } catch (err) {
+      logger.warn(`[monitorService] Overlay taint migration failed: ${err.message}`);
     }
   }
 
