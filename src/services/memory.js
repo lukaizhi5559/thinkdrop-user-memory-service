@@ -13,6 +13,8 @@ import logger from '../utils/logger.js';
 const HNSW_THRESHOLD = 20000;
 // How long (ms) to reuse a cached transient HNSW before rebuilding.
 const HNSW_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// SQL single-quote literal used to escape quotes as ''.
+const SQ = '\'';
 
 class MemoryService {
   constructor() {
@@ -199,11 +201,33 @@ class MemoryService {
       
       if (options.filters) {
         if (options.filters.type) {
-          whereConditions.push(`type = '${options.filters.type}'`);
+          const types = Array.isArray(options.filters.type)
+            ? options.filters.type
+            : [options.filters.type];
+          whereConditions.push(`type IN (${types.map(t => `'${t}'`).join(', ')})`);
+        }
+        if (options.filters.excludeTypes) {
+          const excludeTypes = Array.isArray(options.filters.excludeTypes)
+            ? options.filters.excludeTypes
+            : [options.filters.excludeTypes];
+          for (const excludeType of excludeTypes) {
+            whereConditions.push(`type != '${excludeType}'`);
+          }
         }
         if (options.filters.sessionId) {
           whereConditions.push(`metadata LIKE '%"sessionId":"${options.filters.sessionId}"%'`);
         }
+      }
+
+      // ── Episodic memory split ──────────────────────────────────────────────
+      // Screen captures live in episodic_memory, not memory. Default exclude
+      // them here so callers don't get stale rows before migration.
+      const excludeScreenCapture = !(
+        options.filters?.type === 'screen_capture' ||
+        (Array.isArray(options.filters?.type) && options.filters.type.includes('screen_capture'))
+      );
+      if (excludeScreenCapture) {
+        whereConditions.push('type != \'screen_capture\'');
       }
 
       if (options.sessionId) {
@@ -214,65 +238,114 @@ class MemoryService {
         ? `WHERE ${whereConditions.join(' AND ')} AND embedding IS NOT NULL` 
         : 'WHERE embedding IS NOT NULL';
 
-      // Ensure VSS is loaded before issuing any array_cosine_distance() query.
-      // VSS is intentionally NOT loaded at startup (see database.js initVectorSearch).
-      // This call goes through _enqueue() so it is fully serialized — no screen
-      // monitor INSERT can be in flight at the same time.  After the first call
-      // this is a fast boolean check (no DB round-trip).
-      await this.db.ensureVssLoaded();
+      // Legacy date-range screen capture dedup path — kept for backwards compat
+      // but screen_capture results should now come from episodic.search.
+      const isScreenCaptureDateRange = (startDate || endDate) && !excludeScreenCapture;
 
-      // Threshold-based search:
-      //   < HNSW_THRESHOLD rows → brute-force array_cosine_distance() (~25–55 ms)
-      //   >= HNSW_THRESHOLD rows → transient in-memory HNSW (cached 5 min, never on persistent DB)
       const embeddingValues = queryEmbedding.map(v => v.toString()).join(',');
       const queryVector = `list_value(${embeddingValues})::FLOAT[384]`;
-
-      // Count rows eligible for this search (whereClause already includes embedding IS NOT NULL)
-      const eligibleCountResult = await this.db.query(
-        `SELECT COUNT(*) as count FROM memory ${whereClause}`
-      );
-      const eligibleCount = Number(eligibleCountResult[0]?.count || 0);
-
-      console.log(`🔍 [MEMORY-SEARCH] Eligible rows: ${eligibleCount}, threshold: ${HNSW_THRESHOLD}`);
 
       let results;
       const dbStart = Date.now();
 
-      if (eligibleCount < HNSW_THRESHOLD) {
-        // ── Brute-force path ──────────────────────────────────────────────────
-        console.log('🔍 [MEMORY-SEARCH] Using brute-force search');
-        const sql = `
+      if (isScreenCaptureDateRange) {
+        console.log('🔍 [MEMORY-SEARCH] Using screen-capture date-range dedup');
+        const dedupSql = `
           SELECT 
-            id,
+            MIN(id) as id,
             type,
-            source_text,
-            metadata,
-            screenshot,
-            extracted_text,
-            created_at,
-            (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
+            MIN(source_text) as source_text,
+            MIN(metadata) as metadata,
+            MIN(screenshot) as screenshot,
+            MIN(extracted_text) as extracted_text,
+            MIN(created_at) as created_at,
+            NULL as similarity,
+            NULL as final_score
           FROM memory
           ${whereClause}
-          ORDER BY array_cosine_distance(embedding, ${queryVector})
+          GROUP BY 
+            type,
+            json_extract_string(metadata, '$.appName'),
+            json_extract_string(metadata, '$.windowTitle'),
+            date_trunc('hour', created_at)
+          ORDER BY MIN(created_at) DESC
           LIMIT ${limit}
           OFFSET ${offset}
         `;
-        results = await this.db.query(sql);
+        results = await this.db.query(dedupSql);
       } else {
-        // ── Transient in-memory HNSW path ─────────────────────────────────────
-        // Build (or reuse) a cached in-memory DuckDB instance with HNSW index.
-        // This is completely separate from the persistent DB so CHECKPOINT on
-        // the main DB never touches the HNSW graph.
-        console.log('🔍 [MEMORY-SEARCH] Using transient in-memory HNSW');
-        results = await this._searchWithTransientHnsw(
-          queryVector, whereClause, limit, offset
+        // Ensure VSS is loaded before issuing any array_cosine_distance() query.
+        // VSS is intentionally NOT loaded at startup (see database.js initVectorSearch).
+        // This call goes through _enqueue() so it is fully serialized — no screen
+        // monitor INSERT can be in flight at the same time.  After the first call
+        // this is a fast boolean check (no DB round-trip).
+        await this.db.ensureVssLoaded();
+
+        // Threshold-based search:
+        //   < HNSW_THRESHOLD rows → brute-force array_cosine_distance() (~25–55 ms)
+        //   >= HNSW_THRESHOLD rows → transient in-memory HNSW (cached 5 min, never on persistent DB)
+
+        // Count rows eligible for this search (whereClause already includes embedding IS NOT NULL)
+        const eligibleCountResult = await this.db.query(
+          `SELECT COUNT(*) as count FROM memory ${whereClause}`
         );
+        const eligibleCount = Number(eligibleCountResult[0]?.count || 0);
+
+        console.log(`🔍 [MEMORY-SEARCH] Eligible rows: ${eligibleCount}, threshold: ${HNSW_THRESHOLD}`);
+
+        if (eligibleCount < HNSW_THRESHOLD) {
+          // ── Brute-force path ──────────────────────────────────────────────────
+          console.log('🔍 [MEMORY-SEARCH] Using brute-force search');
+          const sql = `
+            SELECT 
+              id,
+              type,
+              source_text,
+              metadata,
+              screenshot,
+              extracted_text,
+              created_at,
+              (1 - array_cosine_distance(embedding, ${queryVector})) as similarity,
+              (
+                0.7 * (1 - array_cosine_distance(embedding, ${queryVector})) +
+                0.3 * CASE 
+                  WHEN type = 'personal_profile' THEN 1.0
+                  ELSE 1.0 / (1 + ln(1 + GREATEST(DATEDIFF('day', created_at, CURRENT_TIMESTAMP), 0)))
+                END
+              ) as final_score
+            FROM memory
+            ${whereClause}
+            ORDER BY final_score DESC
+            LIMIT ${limit}
+            OFFSET ${offset}
+          `;
+          results = await this.db.query(sql);
+        } else {
+          // ── Transient in-memory HNSW path ─────────────────────────────────────
+          // Build (or reuse) a cached in-memory DuckDB instance with HNSW index.
+          // This is completely separate from the persistent DB so CHECKPOINT on
+          // the main DB never touches the HNSW graph.
+          console.log('🔍 [MEMORY-SEARCH] Using transient in-memory HNSW');
+          results = await this._searchWithTransientHnsw(
+            queryVector, whereClause, limit, offset
+          );
+        }
       }
 
       timings.dbQuery = Date.now() - dbStart;
 
+      // ── BM25 + entity fusion ─────────────────────────────────────────────────
+      // For non-dedup searches, boost vector results that also match keywords or
+      // named entities, and pull in high-scoring keyword matches that vector search
+      // might have missed (e.g. rare names, exact file paths).
+      if (!isScreenCaptureDateRange) {
+        results = await this._fuseWithBm25AndEntities(results, query, userId, whereClause, limit, minSimilarity);
+      }
+
       // Filter by minimum similarity and fetch entities for each result
-      const filteredResults = results.filter(r => r.similarity >= minSimilarity);
+      const filteredResults = isScreenCaptureDateRange
+        ? results
+        : results.filter(r => r.similarity >= minSimilarity);
       
       const duration = Date.now() - startTime;
       
@@ -282,7 +355,10 @@ class MemoryService {
       if (filteredResults.length > 0) {
         console.log('📊 [MEMORY-SEARCH] Top results:');
         filteredResults.slice(0, 3).forEach((result, idx) => {
-          console.log(`  ${idx + 1}. "${result.source_text.substring(0, 60)}..." (similarity: ${result.similarity.toFixed(3)})`);
+          const simLabel = result.similarity != null
+            ? `(similarity: ${result.similarity.toFixed(3)})`
+            : '(deduped screen capture)';
+          console.log(`  ${idx + 1}. "${result.source_text.substring(0, 60)}..." ${simLabel}`);
         });
       } else {
         console.warn('⚠️ [MEMORY-SEARCH] No results found. Checking database...');
@@ -364,6 +440,280 @@ class MemoryService {
       };
     } catch (error) {
       logger.error('Memory search failed', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Fuse vector search results with BM25 keyword matches and entity matches.
+   * Returns a re-ranked list of up to `limit` results.
+   * If the FTS extension is unavailable, returns the original vector results.
+   */
+  async _fuseWithBm25AndEntities(vectorResults, query, userId, whereClause, limit, _minSimilarity) {
+    if (!vectorResults || vectorResults.length === 0) return vectorResults;
+
+    try {
+      await this.db.ensureFtsLoaded();
+    } catch (e) {
+      console.warn('🔍 [MEMORY-SEARCH] BM25 fusion disabled: FTS not available');
+      return vectorResults;
+    }
+
+    // Remove embedding IS NOT NULL constraint from BM25 query — text is enough.
+    const bm25Where = whereClause.replace(/AND embedding IS NOT NULL/g, '').trim();
+    const escapedQuery = query.replace(/\\/g, '\\\\').replace(/'/g, SQ + SQ);
+
+    let bm25Results = [];
+    try {
+      const bm25Sql = `
+        SELECT m.id, m.type, m.source_text, m.metadata, m.screenshot, m.extracted_text, m.created_at,
+               score_bm25.score as bm25_score
+        FROM memory m
+        INNER JOIN (
+          SELECT id, COALESCE(fts_main_memory.match_bm25(id, '${escapedQuery}'), 0) as score
+          FROM memory
+        ) score_bm25 ON m.id = score_bm25.id AND score_bm25.score > 0
+        ${bm25Where}
+        ORDER BY score_bm25.score DESC
+        LIMIT ${limit * 3}
+      `;
+      bm25Results = await this.db.query(bm25Sql);
+    } catch (e) {
+      console.warn('🔍 [MEMORY-SEARCH] BM25 query failed:', e.message);
+    }
+
+    // Entity match: memory IDs whose stored entities match any query term
+    const terms = query
+      .split(/\s+/)
+      .map(t => t.replace(/[^a-zA-Z0-9]/g, ''))
+      .filter(t => t.length > 2);
+    let entityIds = new Set();
+    if (terms.length > 0) {
+      try {
+        const entitySql = `
+          SELECT DISTINCT me.memory_id as id
+          FROM memory_entities me
+          WHERE ${terms.map(t => `me.entity ILIKE '%${t.replace(/'/g, SQ + SQ)}%'`).join(' OR ')}
+        `;
+        const entityResults = await this.db.query(entitySql);
+        entityIds = new Set(entityResults.map(r => r.id));
+      } catch (e) {
+        console.warn('🔍 [MEMORY-SEARCH] Entity query failed:', e.message);
+      }
+    }
+
+    // Normalize BM25 scores to [0, 1]
+    const bm25Scores = bm25Results.map(r => r.bm25_score || 0).filter(s => s > 0);
+    const maxBm25 = bm25Scores.length > 0 ? Math.max(...bm25Scores) : 0;
+    const minBm25 = bm25Scores.length > 0 ? Math.min(...bm25Scores) : 0;
+
+    const vectorMap = new Map(vectorResults.map(r => [r.id, r]));
+    const bm25Map = new Map(bm25Results.map(r => [r.id, r]));
+    const allIds = new Set([...vectorMap.keys(), ...bm25Map.keys()]);
+
+    const nowMs = Date.now();
+    const scored = [];
+    for (const id of allIds) {
+      const vec = vectorMap.get(id);
+      const bm25 = bm25Map.get(id);
+      const vectorScore = vec?.similarity || 0;
+      const bm25Raw = bm25?.bm25_score || 0;
+      const bm25Norm = bm25Raw > 0 && maxBm25 > minBm25
+        ? (bm25Raw - minBm25) / (maxBm25 - minBm25)
+        : 0;
+      const entityBoost = entityIds.has(id) ? 0.1 : 0;
+
+      // Recency boost (already baked into brute-force final_score, but re-apply
+      // here for HNSW and BM25-only rows so final ranking is consistent).
+      const createdAt = new Date(vec?.created_at || bm25?.created_at || 0);
+      const ageDays = Math.max(0, Math.floor((nowMs - createdAt.getTime()) / 86400000));
+      const recency = vec?.type === 'personal_profile' || bm25?.type === 'personal_profile'
+        ? 1.0
+        : 1.0 / (1 + Math.log(1 + ageDays));
+
+      const finalScore = 0.5 * vectorScore + 0.25 * bm25Norm + 0.15 * recency + entityBoost;
+      const row = vec || bm25;
+      scored.push({ ...row, similarity: vectorScore, final_score: finalScore, bm25_score: bm25Raw });
+    }
+
+    scored.sort((a, b) => b.final_score - a.final_score);
+    return scored.slice(0, limit);
+  }
+
+  /**
+   * Search the episodic_memory table (screen captures / activity log).
+   * Supports date-range dedup by app + window + hour and keyword filters.
+   */
+  async searchEpisodicMemories(query, options = {}, context = {}) {
+    const startTime = Date.now();
+    const timings = {};
+
+    try {
+      const userId = extractUserId(context) || options.userId || 'default_user';
+      const limit = options.limit || 25;
+      const offset = options.offset || 0;
+      const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : (parseInt(process.env.MAX_AGE_DAYS) || 365);
+      const startDate = options.startDate || null;
+      const endDate = options.endDate || null;
+
+      // Build WHERE clause for episodic_memory
+      let whereConditions = [`user_id = '${userId}'`];
+      if (startDate) {
+        whereConditions.push(`created_at >= '${startDate}'`);
+      } else if (maxAgeDays > 0) {
+        whereConditions.push(`created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY`);
+      }
+      if (endDate) {
+        whereConditions.push(`created_at <= '${endDate}'`);
+      }
+      if (options.filters?.type) {
+        const types = Array.isArray(options.filters.type) ? options.filters.type : [options.filters.type];
+        whereConditions.push(`type IN (${types.map(t => `'${t}'`).join(', ')})`);
+      }
+      if (options.filters?.excludeTypes) {
+        const excludeTypes = Array.isArray(options.filters.excludeTypes)
+          ? options.filters.excludeTypes
+          : [options.filters.excludeTypes];
+        for (const excludeType of excludeTypes) {
+          whereConditions.push(`type != '${excludeType}'`);
+        }
+      }
+      if (options.filters?.appName) {
+        const escapedAppName = options.filters.appName.replace(/'/g, SQ + SQ);
+        whereConditions.push(`json_extract_string(metadata, '$.appName') = '${escapedAppName}'`);
+      }
+      if (options.filters?.excludeOverlay) {
+        whereConditions.push('json_extract_string(metadata, \'$.overlayTainted\') IS NULL');
+      }
+      if (options.filters?.sessionId) {
+        whereConditions.push(`metadata LIKE '%"sessionId":"${options.filters.sessionId}"%'`);
+      }
+      if (options.sessionId) {
+        whereConditions.push(`metadata LIKE '%"sessionId":"${options.sessionId}"%'`);
+      }
+
+      const whereClause = whereConditions.length > 0
+        ? `WHERE ${whereConditions.join(' AND ')}`
+        : '';
+
+      const dedup = options.dedup !== false;
+      const dbStart = Date.now();
+      let results;
+
+      // Load FTS extension and create episodic index if needed. This is a
+      // no-op after the first call. If FTS is unavailable, keyword ranking
+      // is skipped but the date/app filter still works.
+      let bm25Enabled = false;
+      const trimmedQuery = (query || '').trim();
+      if (trimmedQuery) {
+        try {
+          await this.db.ensureFtsLoaded();
+          bm25Enabled = this.db.isFtsEnabled();
+        } catch (e) {
+          console.warn('🔍 [EPISODIC-SEARCH] FTS not available for keyword ranking:', e.message);
+        }
+      }
+      const escapedQuery = trimmedQuery.replace(/\\/g, '\\\\').replace(/'/g, SQ + SQ);
+      const bm25Join = bm25Enabled && trimmedQuery
+        ? `LEFT JOIN (
+          SELECT id, COALESCE(fts_main_episodic_memory.match_bm25(id, '${escapedQuery}'), 0) as score
+          FROM episodic_memory
+        ) score_bm25 ON episodic_memory.id = score_bm25.id`
+        : '';
+
+      if (dedup) {
+        const sql = `
+          SELECT 
+            MIN(episodic_memory.id) as id,
+            episodic_memory.type,
+            MIN(episodic_memory.source_text) as source_text,
+            MIN(episodic_memory.metadata) as metadata,
+            MIN(episodic_memory.screenshot) as screenshot,
+            MIN(episodic_memory.extracted_text) as extracted_text,
+            MIN(episodic_memory.created_at) as created_at,
+            NULL as similarity,
+            NULL as final_score,
+            MAX(COALESCE(score_bm25.score, 0)) as bm25_score
+          FROM episodic_memory
+          ${bm25Join}
+          ${whereClause}
+          GROUP BY 
+            episodic_memory.type,
+            json_extract_string(episodic_memory.metadata, '$.appName'),
+            json_extract_string(episodic_memory.metadata, '$.windowTitle'),
+            date_trunc('hour', episodic_memory.created_at)
+          ORDER BY MAX(COALESCE(score_bm25.score, 0)) DESC, MIN(episodic_memory.created_at) DESC
+          LIMIT ${limit}
+          OFFSET ${offset}
+        `;
+        results = await this.db.query(sql);
+      } else {
+        const sql = `
+          SELECT 
+            episodic_memory.id,
+            episodic_memory.type,
+            episodic_memory.source_text,
+            episodic_memory.metadata,
+            episodic_memory.screenshot,
+            episodic_memory.extracted_text,
+            episodic_memory.created_at,
+            NULL as similarity,
+            NULL as final_score,
+            COALESCE(score_bm25.score, 0) as bm25_score
+          FROM episodic_memory
+          ${bm25Join}
+          ${whereClause}
+          ORDER BY COALESCE(score_bm25.score, 0) DESC, episodic_memory.created_at DESC
+          LIMIT ${limit}
+          OFFSET ${offset}
+        `;
+        results = await this.db.query(sql);
+      }
+      timings.dbQuery = Date.now() - dbStart;
+
+      const enrichStart = Date.now();
+      const enrichedResults = await Promise.all(
+        results.map(async (result) => {
+          const entitiesSql = `
+            SELECT entity, type, entity_type
+            FROM episodic_entities
+            WHERE memory_id = '${result.id}'
+          `;
+          const entities = await this.db.query(entitiesSql);
+          return {
+            id: result.id,
+            type: result.type || 'screen_capture',
+            text: result.source_text,
+            similarity: result.similarity,
+            entities: entities.map(e => ({
+              type: e.type,
+              value: e.entity,
+              entity_type: e.entity_type
+            })),
+            metadata: parseMetadata(result.metadata),
+            screenshot: result.screenshot,
+            extractedText: result.extracted_text,
+            created_at: result.created_at
+          };
+        })
+      );
+      timings.enrichment = Date.now() - enrichStart;
+      timings.total = Date.now() - startTime;
+
+      logger.info('⏱️  Episodic memory search completed', {
+        query,
+        resultsCount: enrichedResults.length,
+        timings
+      });
+
+      return {
+        results: enrichedResults,
+        total: enrichedResults.length,
+        query,
+        timings
+      };
+    } catch (error) {
+      logger.error('Episodic memory search failed', { error: error.message });
       throw error;
     }
   }
@@ -451,25 +801,34 @@ class MemoryService {
       SELECT row_id as id, (1 - array_cosine_distance(embedding, ${queryVector})) as similarity
       FROM mem_search
       ORDER BY array_cosine_distance(embedding, ${queryVector})
-      LIMIT ${limit + offset}
+      LIMIT ${limit + offset + 100}
     `;
     const hnswResults = await memAll(hnswSql);
-    const pagedIds = hnswResults.slice(offset, offset + limit).map((r) => r.id);
     const simMap = Object.fromEntries(hnswResults.map((r) => [r.id, r.similarity]));
 
-    if (pagedIds.length === 0) return [];
+    if (hnswResults.length === 0) return [];
 
-    const idList = pagedIds.map((id) => `'${id.replace(/'/g, '\'\'')}'`).join(',');
+    const candidateIds = hnswResults.map((r) => r.id);
+    const idList = candidateIds.map((id) => `'${id.replace(/'/g, '\'\'')}'`).join(',');
     const fullRows = await this.db.query(`
       SELECT id, type, source_text, metadata, screenshot, extracted_text, created_at
       FROM memory
       WHERE id IN (${idList})
     `);
 
-    const rowById = Object.fromEntries(fullRows.map((r) => [r.id, r]));
-    return pagedIds
-      .filter((id) => rowById[id])
-      .map((id) => ({ ...rowById[id], similarity: simMap[id] }));
+    const nowMs = Date.now();
+    const scored = fullRows.map((r) => {
+      const ageDays = Math.max(
+        0,
+        Math.floor((nowMs - new Date(r.created_at).getTime()) / 86400000)
+      );
+      const recency = r.type === 'personal_profile' ? 1.0 : 1.0 / (1 + Math.log(1 + ageDays));
+      const finalScore = 0.7 * (simMap[r.id] || 0) + 0.3 * recency;
+      return { ...r, similarity: simMap[r.id], finalScore };
+    });
+
+    scored.sort((a, b) => b.finalScore - a.finalScore);
+    return scored.slice(offset, offset + limit);
   }
 
   /**
@@ -784,7 +1143,7 @@ class MemoryService {
           extracted_text,
           metadata,
           created_at
-        FROM memory
+        FROM episodic_memory
         WHERE type = 'screen_capture'
           AND user_id = '${userId}'
           AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeSeconds}' SECOND

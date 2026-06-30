@@ -2,11 +2,15 @@ import duckdb from 'duckdb';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 class DatabaseService {
   constructor(dbPath) {
-    this.dbPath = dbPath || process.env.DB_PATH || './data/user_memory.duckdb';
+    this.dbPath = dbPath || process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'user_memory.duckdb');
     this.db = null;
     this.connection = null;
     this.isInitialized = false;
@@ -115,6 +119,12 @@ class DatabaseService {
             // Load VSS extension for HNSW vector indexing
             await this.initVectorSearch();
 
+            // Install FTS extension for BM25 keyword search (load deferred to first search)
+            await this.initFts();
+
+            // Migrate existing screen captures into the new episodic_memory table
+            await this.migrateScreenCapturesToEpisodic();
+
             this.isInitialized = true;
             logger.info(`Database initialized successfully: ${this.dbPath}`);
             
@@ -166,6 +176,46 @@ class DatabaseService {
       await this.run('CREATE INDEX IF NOT EXISTS idx_memory_user_type_created ON memory(user_id, type, created_at DESC)');
       
       logger.info('Memory table indexes created (including composite indexes)');
+
+      // Create episodic_memory table for screen captures / activity log
+      // This isolates high-volume noisy captures from semantic memory search.
+      logger.info('Creating episodic_memory table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS episodic_memory (
+          id TEXT PRIMARY KEY,
+          user_id TEXT,
+          type TEXT DEFAULT 'screen_capture',
+          source_text TEXT,
+          metadata TEXT,
+          screenshot TEXT,
+          extracted_text TEXT,
+          embedding FLOAT[384],
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_user_id ON episodic_memory(user_id)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_type ON episodic_memory(type)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_created_at ON episodic_memory(created_at)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_user_created ON episodic_memory(user_id, created_at DESC)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_user_type_created ON episodic_memory(user_id, type, created_at DESC)');
+      logger.info('Episodic_memory table created');
+
+      // Create episodic_entities table for named entities extracted from captures
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS episodic_entities (
+          id TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL,
+          entity TEXT NOT NULL,
+          type TEXT,
+          entity_type TEXT,
+          normalized_value TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_entities_memory_id ON episodic_entities(memory_id)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_episodic_entities_entity ON episodic_entities(entity)');
+      logger.info('Episodic_entities table created');
 
       // Create memory_entities table
       logger.info('Creating memory_entities table...');
@@ -956,6 +1006,117 @@ class DatabaseService {
       logger.warn('VSS LOAD failed — search will use fallback', { error: error.message });
       this.vssEnabled = false;
     }
+  }
+
+  /**
+   * One-time migration: copy existing screen_capture rows from memory to the
+   * new episodic_memory table. Idempotent — skips rows already present.
+   */
+  async migrateScreenCapturesToEpisodic() {
+    try {
+      const countResult = await this.all(
+        'SELECT COUNT(*) as count FROM memory WHERE type = \'screen_capture\''
+      );
+      const count = Number(countResult?.[0]?.count || 0);
+      if (count === 0) {
+        logger.info('No screen_capture rows to migrate to episodic_memory');
+        return;
+      }
+
+      await this.run(`
+        INSERT INTO episodic_memory (id, user_id, type, source_text, metadata, screenshot, extracted_text, embedding, created_at, updated_at)
+        SELECT id, user_id, type, source_text, metadata, screenshot, extracted_text, embedding, created_at, updated_at
+        FROM memory
+        WHERE type = 'screen_capture'
+          AND id NOT IN (SELECT id FROM episodic_memory)
+      `);
+
+      await this.run(`
+        INSERT INTO episodic_entities (id, memory_id, entity, type, entity_type, normalized_value, created_at)
+        SELECT id, memory_id, entity, type, entity_type, normalized_value, created_at
+        FROM memory_entities
+        WHERE memory_id IN (SELECT id FROM memory WHERE type = 'screen_capture')
+          AND id NOT IN (SELECT id FROM episodic_entities)
+      `);
+
+      // Remove migrated rows from memory so semantic search stays clean
+      await this.run(`
+        DELETE FROM memory_entities
+        WHERE memory_id IN (SELECT id FROM memory WHERE type = 'screen_capture')
+      `);
+      await this.run(`
+        DELETE FROM memory WHERE type = 'screen_capture'
+      `);
+
+      logger.info(`Migrated ${count} screen_capture rows to episodic_memory`);
+    } catch (error) {
+      logger.warn('Screen-capture migration to episodic_memory failed', { error: error.message });
+    }
+  }
+
+  /**
+   * Install the FTS extension at startup and create the BM25 index.
+   * LOAD is deferred to ensureFtsLoaded() to avoid the same startup-hook
+   * instability that required VSS to be loaded lazily.
+   */
+  async initFts() {
+    try {
+      await this.run('INSTALL fts');
+      logger.info('FTS extension installed (load deferred to first search)');
+      this._ftsEnabled = false; // becomes true after ensureFtsLoaded() succeeds
+    } catch (error) {
+      logger.warn('FTS extension not available', { error: error.message });
+      this._ftsEnabled = false;
+    }
+  }
+
+  /**
+   * Load the FTS extension on first call, create the BM25 indexes, then cache.
+   * Called by memory.js before any BM25 query.
+   */
+  async ensureFtsLoaded() {
+    if (this._ftsLoaded) return;
+    try {
+      await this.run('LOAD fts');
+      logger.info('FTS extension loaded (deferred, first search)');
+    } catch (error) {
+      logger.warn('FTS LOAD failed — BM25 fusion will be disabled', { error: error.message });
+      this._ftsEnabled = false;
+      return;
+    }
+
+    // Create the FTS indexes using the supported PRAGMA API. The old
+    // CREATE INDEX ... USING fts syntax is incompatible with the FTS extension
+    // version installed by DuckDB 1.4.4 and caused C++ crashes during startup.
+    try {
+      const ftsTables = ['memory', 'episodic_memory'];
+      for (const table of ftsTables) {
+        const schemaName = `fts_main_${table}`;
+        const schemaExists = await this.all(
+          `SELECT COUNT(*) as count FROM information_schema.schemata WHERE schema_name = '${schemaName}'`
+        );
+        if (Number(schemaExists[0]?.count || 0) === 0) {
+          await this.run(`PRAGMA create_fts_index('${table}', 'id', 'source_text')`);
+          logger.info('FTS index created', { table, schema: schemaName });
+        } else {
+          logger.debug('FTS index already exists', { table, schema: schemaName });
+        }
+      }
+      this._ftsLoaded = true;
+      this._ftsEnabled = true;
+      logger.info('FTS indexes ready');
+    } catch (error) {
+      logger.warn('FTS index creation failed — BM25 fusion will be disabled', { error: error.message });
+      this._ftsLoaded = true;
+      this._ftsEnabled = false;
+    }
+  }
+
+  /**
+   * Return whether the FTS extension and indexes are ready for BM25 queries.
+   */
+  isFtsEnabled() {
+    return this._ftsEnabled === true;
   }
 
   /**

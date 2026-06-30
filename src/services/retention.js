@@ -165,6 +165,17 @@ class RetentionService {
         `DELETE FROM memory WHERE created_at < '${cutoffDate.toISOString()}'`
       );
 
+      // Delete episodic memory entities and records
+      await this.db.execute(`
+        DELETE FROM episodic_entities
+        WHERE memory_id IN (
+          SELECT id FROM episodic_memory WHERE created_at < '${cutoffDate.toISOString()}'
+        )
+      `);
+      await this.db.execute(
+        `DELETE FROM episodic_memory WHERE created_at < '${cutoffDate.toISOString()}'`
+      );
+
       // Compact HNSW index to prune deleted entries
       await this.db.compactHnswIndex();
 

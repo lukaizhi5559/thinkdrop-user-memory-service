@@ -114,7 +114,7 @@ class MonitorService {
       try {
         const seedRows = await this.db.query(`
           SELECT json_extract_string(metadata, '$.appName') as appName
-          FROM memory
+          FROM episodic_memory
           WHERE type = 'screen_capture'
             AND json_extract_string(metadata, '$.appName') NOT IN ('Electron', 'ThinkDrop', 'unknown')
             AND json_extract_string(metadata, '$.appName') IS NOT NULL
@@ -501,7 +501,7 @@ class MonitorService {
     // source_text = cleaned text for embedding/search
     // extracted_text = filtered text (gibberish removed, redacted, no noise)
     const sql = `
-      INSERT INTO memory (
+      INSERT INTO episodic_memory (
         id, user_id, type, source_text, metadata,
         extracted_text, embedding, created_at, updated_at
       ) VALUES (
@@ -533,7 +533,7 @@ class MonitorService {
     for (const entity of entities) {
       const entityId = `ent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const entitySql = `
-        INSERT INTO memory_entities (id, memory_id, entity, type, entity_type, normalized_value)
+        INSERT INTO episodic_entities (id, memory_id, entity, type, entity_type, normalized_value)
         VALUES (
           '${entityId}',
           '${memoryId}',
@@ -560,7 +560,7 @@ class MonitorService {
       // Find candidate rows that are not already flagged
       const candidates = await this.db.query(`
         SELECT id, metadata, extracted_text, source_text
-        FROM memory
+        FROM episodic_memory
         WHERE type = 'screen_capture'
           AND json_extract_string(metadata, '$.overlayTainted') IS NULL
       `);
@@ -573,7 +573,7 @@ class MonitorService {
           metadata.overlayTainted = true;
           const safeMetadata = JSON.stringify(metadata).replace(/'/g, '\'\'');
           await this.db.execute(`
-            UPDATE memory
+            UPDATE episodic_memory
             SET metadata = '${safeMetadata}'
             WHERE id = '${row.id.replace(/'/g, '\'\'')}'
           `);

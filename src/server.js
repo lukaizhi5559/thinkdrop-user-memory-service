@@ -21,6 +21,7 @@ import errorHandler from './middleware/errorHandler.js';
 // Import routes
 import storeRoute from './routes/store.js';
 import searchRoute from './routes/search.js';
+import episodicSearchRoute from './routes/episodicSearch.js';
 import retrieveRoute from './routes/retrieve.js';
 import updateRoute from './routes/update.js';
 import deleteRoute from './routes/delete.js';
@@ -140,6 +141,19 @@ app.get('/service.capabilities', (req, res) => {
           }
         },
         {
+          name: 'episodic.search',
+          description: 'Search episodic memory (screen captures / activity log) by date and keyword filters',
+          inputSchema: {
+            query: 'string (required)',
+            limit: 'number (optional, default: 25)',
+            offset: 'number (optional, default: 0)',
+            startDate: 'string (optional)',
+            endDate: 'string (optional)',
+            filters: 'object (optional)',
+            dedup: 'boolean (optional, default: true)'
+          }
+        },
+        {
           name: 'memory.retrieve',
           description: 'Retrieve specific memory by ID',
           inputSchema: {
@@ -221,6 +235,7 @@ app.use(validateMCPRequest);
 // MCP action routes
 app.use(storeRoute);
 app.use(searchRoute);
+app.use(episodicSearchRoute);
 app.use(retrieveRoute);
 app.use(updateRoute);
 app.use(deleteRoute);
@@ -283,6 +298,7 @@ async function startServer() {
       console.log('\n📊 Available Actions:');
       console.log('   - POST /memory.store');
       console.log('   - POST /memory.search');
+      console.log('   - POST /episodic.search');
       console.log('   - POST /memory.retrieve');
       console.log('   - POST /memory.update');
       console.log('   - POST /memory.delete');
