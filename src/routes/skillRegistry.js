@@ -49,6 +49,26 @@ router.post('/skill.remove', async (req, res, next) => {
 });
 
 /**
+ * POST /skill.removeByDomain
+ * Remove all installed skills for a given source_domain (used by agent delete cascade).
+ * Body: { payload: { sourceDomain }, context, requestId }
+ */
+router.post('/skill.removeByDomain', async (req, res, next) => {
+  try {
+    const { payload, requestId } = req.body;
+
+    if (!payload?.sourceDomain) {
+      return res.status(400).json({ error: 'Missing required field: sourceDomain' });
+    }
+
+    const result = await skillRegistryService.removeByDomain(payload.sourceDomain);
+    res.json(formatMCPResponse('skill.removeByDomain', requestId, 'ok', result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * POST /skill.list
  * List all installed skills.
  * Body: { payload: { enabledOnly? }, context, requestId }

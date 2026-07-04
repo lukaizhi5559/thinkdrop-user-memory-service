@@ -219,6 +219,26 @@ class SkillRegistryService {
   }
 
   /**
+   * Remove all skills for a given source_domain (used by agent delete cascade).
+   * Returns { deleted: number }.
+   */
+  async removeByDomain(domain) {
+    const safe = (s) => s.replace(/'/g, SQ + SQ);
+    const rows = await this.db.query(
+      `SELECT name FROM installed_skills WHERE source_domain LIKE '%${safe(domain)}%'`
+    );
+    if (rows.length === 0) {
+      return { deleted: 0 };
+    }
+    for (const r of rows) {
+      await this.db.execute(`DELETE FROM skill_health WHERE skill_name = '${safe(r.name)}'`).catch(() => {});
+      await this.db.execute(`DELETE FROM installed_skills WHERE name = '${safe(r.name)}'`);
+    }
+    logger.info(`[SkillRegistry] Removed ${rows.length} skills for domain: ${domain}`);
+    return { deleted: rows.length };
+  }
+
+  /**
    * List all installed skills, including contract_md for schedule parsing.
    */
   async list(enabledOnly = false) {
