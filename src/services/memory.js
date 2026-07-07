@@ -597,6 +597,7 @@ class MemoryService {
         : '';
 
       const dedup = options.dedup !== false;
+      const diverseDays = options.diverseDays === true;
       const dbStart = Date.now();
       let results;
 
@@ -642,10 +643,13 @@ class MemoryService {
             json_extract_string(episodic_memory.metadata, '$.appName'),
             json_extract_string(episodic_memory.metadata, '$.windowTitle'),
             date_trunc('hour', episodic_memory.created_at)
-          ORDER BY MAX(COALESCE(score_bm25.score, 0)) DESC, MIN(episodic_memory.created_at) DESC
+          ORDER BY ${diverseDays ? 'CASE WHEN MAX(COALESCE(score_bm25.score, 0)) > 0 THEN MAX(COALESCE(score_bm25.score, 0)) ELSE -1 END DESC, date_trunc(\'day\', MIN(episodic_memory.created_at)) ASC, MIN(episodic_memory.created_at) ASC' : 'CASE WHEN MAX(COALESCE(score_bm25.score, 0)) > 0 THEN MAX(COALESCE(score_bm25.score, 0)) ELSE -1 END DESC, MIN(episodic_memory.created_at) DESC'}
           LIMIT ${limit}
           OFFSET ${offset}
         `;
+        console.log(`🔍 [EPISODIC-SEARCH] SQL Query: ${sql}`);
+        console.log(`🔍 [EPISODIC-SEARCH] WHERE clause: ${whereClause}`);
+        console.log(`🔍 [EPISODIC-SEARCH] Date range: ${startDate} to ${endDate}`);
         results = await this.db.query(sql);
       } else {
         const sql = `
@@ -667,6 +671,9 @@ class MemoryService {
           LIMIT ${limit}
           OFFSET ${offset}
         `;
+        console.log(`🔍 [EPISODIC-SEARCH] Non-dedup SQL Query: ${sql}`);
+        console.log(`🔍 [EPISODIC-SEARCH] WHERE clause: ${whereClause}`);
+        console.log(`🔍 [EPISODIC-SEARCH] Date range: ${startDate} to ${endDate}`);
         results = await this.db.query(sql);
       }
       timings.dbQuery = Date.now() - dbStart;
@@ -1178,6 +1185,89 @@ class MemoryService {
       };
     } catch (error) {
       logger.error('Failed to get recent OCR', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * List distinct app names from episodic_memory for a given date range.
+   * Used by retrieveMemory to discover app names dynamically from actual data
+   * instead of a hardcoded list.
+   */
+  async listDistinctApps(startDate, endDate, userId, options = {}) {
+    try {
+      const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : (parseInt(process.env.MAX_AGE_DAYS) || 365);
+      let whereConditions = [
+        `user_id = '${userId}'`,
+        'type = \'screen_capture\'',
+        'json_extract_string(metadata, \'$.overlayTainted\') IS NULL',
+        'json_extract_string(metadata, \'$.appName\') IS NOT NULL',
+        'json_extract_string(metadata, \'$.appName\') NOT IN (\'Electron\', \'ThinkDrop\', \'unknown\')'
+      ];
+      if (startDate) {
+        whereConditions.push(`created_at >= '${startDate}'`);
+      } else if (maxAgeDays > 0) {
+        whereConditions.push(`created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY`);
+      }
+      if (endDate) {
+        whereConditions.push(`created_at <= '${endDate}'`);
+      }
+
+      const sql = `
+        SELECT DISTINCT json_extract_string(metadata, '$.appName') as appName
+        FROM episodic_memory
+        WHERE ${whereConditions.join(' AND ')}
+        ORDER BY appName
+      `;
+      const results = await this.db.query(sql);
+      return results.map(r => r.appName).filter(Boolean);
+    } catch (error) {
+      logger.error('Failed to list distinct apps', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * List top app/window title pairs from episodic_memory for a given date range.
+   * Used by retrieveMemory to build BM25 queries with the actual vocabulary
+   * present in the data — no hardcoded platform names needed.
+   */
+  async listTopKeywords(startDate, endDate, userId, options = {}) {
+    try {
+      const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : (parseInt(process.env.MAX_AGE_DAYS) || 365);
+      const limit = options.limit || 20;
+      let whereConditions = [
+        `user_id = '${userId}'`,
+        'type = \'screen_capture\'',
+        'json_extract_string(metadata, \'$.overlayTainted\') IS NULL',
+        'json_extract_string(metadata, \'$.appName\') IS NOT NULL',
+        'json_extract_string(metadata, \'$.appName\') NOT IN (\'Electron\', \'ThinkDrop\', \'unknown\')'
+      ];
+      if (startDate) {
+        whereConditions.push(`created_at >= '${startDate}'`);
+      } else if (maxAgeDays > 0) {
+        whereConditions.push(`created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY`);
+      }
+      if (endDate) {
+        whereConditions.push(`created_at <= '${endDate}'`);
+      }
+
+      const sql = `
+        SELECT DISTINCT
+          json_extract_string(metadata, '$.appName') as appName,
+          json_extract_string(metadata, '$.windowTitle') as windowTitle
+        FROM episodic_memory
+        WHERE ${whereConditions.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `;
+      const results = await this.db.query(sql);
+      return results.map(r => ({
+        appName: r.appName,
+        windowTitle: r.windowTitle
+      })).filter(r => r.appName);
+    } catch (error) {
+      logger.error('Failed to list top keywords', { error: error.message });
       throw error;
     }
   }

@@ -26,4 +26,45 @@ router.post('/episodic.search', async (req, res, next) => {
   }
 });
 
+router.post('/episodic.apps', async (req, res, next) => {
+  try {
+    const { payload, context, requestId } = req.body;
+    const userId = context?.userId || payload?.userId || 'default_user';
+    const startDate = payload?.startDate || null;
+    const endDate = payload?.endDate || null;
+
+    const apps = await memoryService.listDistinctApps(startDate, endDate, userId, payload);
+
+    res.json(formatMCPResponse(
+      'episodic.apps',
+      requestId,
+      'ok',
+      { apps }
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/episodic.keywords', async (req, res, next) => {
+  try {
+    const { payload, context, requestId } = req.body;
+    const userId = context?.userId || payload?.userId || 'default_user';
+    const startDate = payload?.startDate || null;
+    const endDate = payload?.endDate || null;
+    const limit = payload?.limit || 20;
+
+    const keywords = await memoryService.listTopKeywords(startDate, endDate, userId, { limit });
+
+    res.json(formatMCPResponse(
+      'episodic.keywords',
+      requestId,
+      'ok',
+      { keywords }
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
