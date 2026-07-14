@@ -228,6 +228,18 @@ app.get('/service.capabilities', (req, res) => {
   });
 });
 
+// ── Lightweight /ping endpoint (no auth required) ───────────────────────────
+// Used by ThinkDropMCPClient preflight checks. POST receives an MCP envelope,
+// GET is a simple curl-friendly health check. Both return a minimal success
+// response that the client treats as healthy.
+app.get('/ping', (req, res) => {
+  res.json({ status: 'ok', service: 'user-memory' });
+});
+
+app.post('/ping', (req, res) => {
+  res.json({ status: 'ok', service: 'user-memory' });
+});
+
 // Apply auth and validation to all MCP routes
 app.use(authMiddleware);
 app.use(validateMCPRequest);
