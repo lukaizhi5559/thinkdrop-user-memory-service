@@ -9,6 +9,37 @@ import { PNG } from 'pngjs';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import http from 'http';
+import { EventEmitter } from 'events';
+
+// ── Event-driven heartbeat notification ──────────────────────────────────────
+// When monitor events fire, POST a notification to the personality-service
+// so it can trigger an event-driven Tier 2 awareness check.
+const PERSONALITY_SERVICE_PORT = parseInt(process.env.PERSONALITY_SERVICE_PORT || '3008', 10);
+const HEARTBEAT_NOTIFY_ENABLED = process.env.HEARTBEAT_NOTIFY_ENABLED !== 'false';
+
+function notifyPersonalityService(eventType, info) {
+  if (!HEARTBEAT_NOTIFY_ENABLED) return;
+  const body = JSON.stringify({
+    version: 'mcp.v1',
+    service: 'personality-service',
+    action: 'monitor.event',
+    payload: { eventType, info },
+    requestId: 'mon_evt_' + Date.now(),
+  });
+  const req = http.request({
+    hostname: '127.0.0.1',
+    port: PERSONALITY_SERVICE_PORT,
+    path: '/monitor.event',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    timeout: 3000,
+  }, (res) => { res.resume(); });
+  req.on('error', () => { /* personality-service may not be running — silent */ });
+  req.on('timeout', () => { req.destroy(); });
+  req.write(body);
+  req.end();
+}
 
 const KNOWN_APPS = {
   'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
@@ -58,8 +89,9 @@ function isOverlayTainted(text) {
   return false;
 }
 
-class MonitorService {
+class MonitorService extends EventEmitter {
   constructor() {
+    super();
     this.isRunning = false;
     this.intervalId = null;
     this.captureInterval = parseInt(process.env.SCREEN_CAPTURE_INTERVAL || '5000', 10);
@@ -223,6 +255,10 @@ class MonitorService {
           this._invalidateBoundaryCache(this.lastAppName, this.lastWindowTitle);
         }
         this._enqueueAppEnrichment(appName, windowTitle);
+        // Event-driven heartbeat: emit app_change for subscribers (e.g. heartbeat.cjs)
+        this.emit('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName });
+        // Notify personality-service (cross-process) to trigger event-driven Tier 2
+        notifyPersonalityService('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName });
       }
       this.lastAppName = appName;
       this.lastWindowTitle = windowTitle;
@@ -258,6 +294,10 @@ class MonitorService {
         if (diffRatio > this.BOUNDARY_INVALIDATION_THRESHOLD) {
           logger.info('[monitorService] Pixel diff >30%, invalidating boundary cache', { appName, windowTitle, diffRatio: diffRatio.toFixed(3) });
           this._invalidateBoundaryCache(appName, windowTitle);
+          // Event-driven heartbeat: emit screen_change for major visual changes
+          this.emit('screen_change', { app: appName, title: windowTitle, diffRatio });
+          // Notify personality-service (cross-process) to trigger event-driven Tier 2
+          notifyPersonalityService('screen_change', { app: appName, title: windowTitle, diffRatio: diffRatio.toFixed(3) });
         }
       }
 
