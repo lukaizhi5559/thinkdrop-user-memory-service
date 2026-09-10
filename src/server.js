@@ -30,6 +30,7 @@ import classifyRoute from './routes/classify.js';
 import debugRoute from './routes/debug.js';
 import healthRoute from './routes/health.js';
 import recentOcrRoute from './routes/recentOcr.js';
+import appHistoryRoute from './routes/appHistory.js';
 import skillPromptRoute from './routes/skillPrompt.js';
 import skillRegistryRoute from './routes/skillRegistry.js';
 import contextRuleRoute from './routes/contextRule.js';
@@ -214,6 +215,18 @@ app.get('/service.capabilities', (req, res) => {
           inputSchema: {
             maxAgeSeconds: 'number (optional, default: 10)'
           }
+        },
+        {
+          name: 'memory.getAppHistory',
+          description: 'Get today\'s active-app history in sequential order (for App-Flow navigation)',
+          inputSchema: {
+            maxAgeHours: 'number (optional, default: 24)'
+          }
+        },
+        {
+          name: 'memory.getPreviousActiveApp',
+          description: 'Get the last non-overlay app the user was in before switching to ThinkDrop',
+          inputSchema: {}
         }
       ],
       features: [
@@ -256,6 +269,7 @@ app.use(classifyRoute);
 app.use(debugRoute);
 app.use(healthRoute);
 app.use(recentOcrRoute);
+app.use(appHistoryRoute);
 app.use(skillPromptRoute);
 app.use(skillRegistryRoute);
 app.use(contextRuleRoute);
@@ -317,6 +331,8 @@ async function startServer() {
       console.log('   - POST /memory.list');
       console.log('   - POST /memory.classify-conversational-query');
       console.log('   - POST /memory.getRecentOcr');
+      console.log('   - POST /memory.getAppHistory');
+      console.log('   - POST /memory.getPreviousActiveApp');
       console.log('   - POST /personality.getState');
       console.log('   - POST /personality.event');
       console.log('   - POST /personality.resetState');

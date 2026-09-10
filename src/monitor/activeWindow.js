@@ -87,6 +87,7 @@ export async function getActiveWindow() {
     const appName = win.owner?.name || 'unknown';
     let windowTitle = win.title || '';
     const url = win.url || null;
+    const bounds = win.bounds || null;
 
     // If title is empty (Screen Recording permission not granted),
     // try browser-specific AppleScript as fallback (async — non-blocking)
@@ -111,7 +112,7 @@ export async function getActiveWindow() {
       }
     }
 
-    const result = { appName, windowTitle: windowTitle || 'unknown', url };
+    const result = { appName, windowTitle: windowTitle || 'unknown', url, bounds };
     _windowCache = { result, ts: Date.now() };
     return result;
   } catch (error) {
@@ -122,7 +123,7 @@ export async function getActiveWindow() {
       return result;
     }
     logger.error('Failed to get active window', { error: error.message });
-    return { appName: 'unknown', windowTitle: 'unknown', url: null };
+    return { appName: 'unknown', windowTitle: 'unknown', url: null, bounds: null };
   }
 }
 

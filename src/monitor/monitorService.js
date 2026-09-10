@@ -113,6 +113,89 @@ class MonitorService extends EventEmitter {
     this.lastScreenWidth = 0;
     this.lastScreenHeight = 0;
     this.BOUNDARY_INVALIDATION_THRESHOLD = 0.30; // 30% pixel diff triggers cache invalidation
+    // ── Active-app-history tracker (App-Flow) ────────────────────────────────
+    // Sequential list of app switches for the current day, used by app.runner.cjs
+    // to replace URL-first navigation in the browser flow.
+    this.appHistory = [];
+    this.appHistoryFile = path.join(os.homedir(), '.thinkdrop', 'app-history.json');
+    this._appHistoryPersistTimer = null;
+    this._loadAppHistory();
+  }
+
+  // ── Active-app-history tracker methods (App-Flow) ─────────────────────────
+  // Maintains an in-memory + persisted list of app switches for the current day.
+  // Used by app.runner.cjs to replace URL-first navigation in the browser flow.
+
+  _loadAppHistory() {
+    try {
+      if (!fs.existsSync(this.appHistoryFile)) return;
+      const raw = JSON.parse(fs.readFileSync(this.appHistoryFile, 'utf8'));
+      // Filter to today's date
+      const today = new Date().toISOString().slice(0, 10);
+      this.appHistory = (Array.isArray(raw) ? raw : [])
+        .filter(e => (e.timestamp || '').slice(0, 10) === today);
+      logger.info(`[monitorService] Loaded ${this.appHistory.length} app-history entries for today`);
+    } catch (_) { this.appHistory = []; }
+  }
+
+  _persistAppHistory() {
+    // Debounced — coalesce rapid switches into a single write
+    if (this._appHistoryPersistTimer) return;
+    this._appHistoryPersistTimer = setTimeout(() => {
+      this._appHistoryPersistTimer = null;
+      try {
+        const dir = path.dirname(this.appHistoryFile);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(this.appHistoryFile, JSON.stringify(this.appHistory.slice(-500)));
+      } catch (e) {
+        logger.debug(`[monitorService] app-history persist failed: ${e.message}`);
+      }
+    }, 2000);
+  }
+
+  _recordAppSwitch(appName, windowTitle, bounds, url) {
+    if (!appName) return;
+    // Dedupe consecutive same-app entries
+    const last = this.appHistory[this.appHistory.length - 1];
+    if (last && last.appName === appName) return;
+    const entry = {
+      appName,
+      category: KNOWN_APPS[appName] || 'other',
+      windowTitle: windowTitle || '',
+      bounds: bounds || null,
+      timestamp: new Date().toISOString(),
+      url: url || null,
+    };
+    this.appHistory.push(entry);
+    // Cap at 500 entries per day
+    if (this.appHistory.length > 500) this.appHistory.shift();
+    this._persistAppHistory();
+  }
+
+  getAppHistory({ maxAgeHours = 24 } = {}) {
+    const cutoff = Date.now() - maxAgeHours * 3600 * 1000;
+    return this.appHistory.filter(e => new Date(e.timestamp).getTime() >= cutoff);
+  }
+
+  getPreviousActiveApp() {
+    // Find the last non-overlay app entry from history
+    const SKIP_APPS = ['Electron', 'ThinkDrop'];
+    for (let i = this.appHistory.length - 1; i >= 0; i--) {
+      const e = this.appHistory[i];
+      if (!SKIP_APPS.some(s => e.appName?.includes(s))) return e;
+    }
+    // Fallback to lastNonOverlayApp
+    if (this.lastNonOverlayApp) {
+      return {
+        appName: this.lastNonOverlayApp,
+        category: KNOWN_APPS[this.lastNonOverlayApp] || 'other',
+        windowTitle: '',
+        bounds: null,
+        timestamp: new Date().toISOString(),
+        url: null,
+      };
+    }
+    return null;
   }
 
   /**
@@ -226,7 +309,7 @@ class MonitorService extends EventEmitter {
       }
 
       // Step 2: Get active window — cheap on same-app ticks via cached result
-      const { appName, windowTitle, url } = await getActiveWindow();
+      const { appName, windowTitle, url, bounds } = await getActiveWindow();
 
       // Skip if the active app is the ThinkDrop overlay itself
       const SKIP_APPS = ['Electron', 'ThinkDrop'];
@@ -259,6 +342,8 @@ class MonitorService extends EventEmitter {
         this.emit('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName });
         // Notify personality-service (cross-process) to trigger event-driven Tier 2
         notifyPersonalityService('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName });
+        // ── App-Flow: record app switch in active-app-history ──
+        this._recordAppSwitch(appName, windowTitle, bounds, url);
       }
       this.lastAppName = appName;
       this.lastWindowTitle = windowTitle;
