@@ -7,7 +7,7 @@ import fs from 'fs';
 const SQ = '\x27';
 const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
-const VALID_EXEC_TYPES = ['node', 'shell', 'python'];
+const VALID_EXEC_TYPES = ['node', 'shell', 'python', 'instruction'];
 const SKILL_NAME_PATTERN = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 const REQUIRED_FRONTMATTER = ['name', 'description', 'exec_path', 'exec_type'];
 
@@ -97,29 +97,42 @@ function validateContract(contractMd) {
       `Invalid skill contract: exec_type 'python' requires a .py exec_path, but got "${fm.exec_path}".`
     );
   }
+  // exec_type: instruction → exec_path must be a .md file (knowledge/prompt-only skill)
+  if (fm.exec_type === 'instruction' && !resolvedPath.endsWith('.md')) {
+    throw new Error(
+      `Invalid skill contract: exec_type 'instruction' requires a .md exec_path, but got "${fm.exec_path}". ` +
+      'Instruction skills are knowledge/prompt-only and must reference a skill.md file.'
+    );
+  }
+  // .md exec_path with exec_type: instruction is valid — do NOT force 'shell'
 
   // ── Contract body quality checks ──────────────────────────────────────────
   // These run after frontmatter validation so the body is always extracted
   // from a known-valid contract structure.
+  // NOTE: Instruction skills (knowledge/prompt-only) are exempt from these
+  // checks — knowledge docs may have odd code fences (code examples) and
+  // short bodies are valid for prompt-only skills.
   const fmBlock = contractMd.match(/^---\s*\n[\s\S]*?\n---/);
   const bodyText = fmBlock ? contractMd.slice(fmBlock[0].length) : contractMd;
 
-  // 1. Truncation guard: odd number of ``` fences means the LLM was cut off
-  //    mid-code-block (e.g. synthesize hit maxTokens mid-curl-command).
-  const fenceCount = (bodyText.match(/^```/mg) || []).length;
-  if (fenceCount % 2 !== 0) {
-    throw new Error(
-      `Skill contract appears truncated — odd number of code fences (${fenceCount}). ` +
-      'Increase synthesize maxTokens and regenerate the skill.'
-    );
-  }
+  if (fm.exec_type !== 'instruction') {
+    // 1. Truncation guard: odd number of ``` fences means the LLM was cut off
+    //    mid-code-block (e.g. synthesize hit maxTokens mid-curl-command).
+    const fenceCount = (bodyText.match(/^```/mg) || []).length;
+    if (fenceCount % 2 !== 0) {
+      throw new Error(
+        `Skill contract appears truncated — odd number of code fences (${fenceCount}). ` +
+        'Increase synthesize maxTokens and regenerate the skill.'
+      );
+    }
 
-  // 2. Minimum body length — catches empty or near-empty generations.
-  if (bodyText.trim().length < 50) {
-    throw new Error(
-      `Skill contract body is too short (${bodyText.trim().length} chars). ` +
-      'The contract was likely truncated or failed to generate.'
-    );
+    // 2. Minimum body length — catches empty or near-empty generations.
+    if (bodyText.trim().length < 50) {
+      throw new Error(
+        `Skill contract body is too short (${bodyText.trim().length} chars). ` +
+        'The contract was likely truncated or failed to generate.'
+      );
+    }
   }
 
   // 3. Forbidden OAuth token-file pattern — prevents poisoned contractMd from
