@@ -4,12 +4,14 @@ import OCRService, { getOCRService } from './ocrService.js';
 import { getDatabaseService } from '../services/database.js';
 import { getEmbeddingService } from '../services/embeddings.js';
 import { generateMemoryId } from '../utils/helpers.js';
+import { structureOcrOverlayItems } from '../utils/ocrStructure.js';
 import logger from '../utils/logger.js';
 import { PNG } from 'pngjs';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import http from 'http';
+import { execSync, spawn } from 'child_process';
 import { EventEmitter } from 'events';
 
 // ── Event-driven heartbeat notification ──────────────────────────────────────
@@ -119,6 +121,10 @@ class MonitorService extends EventEmitter {
     this.appHistory = [];
     this.appHistoryFile = path.join(os.homedir(), '.thinkdrop', 'app-history.json');
     this._appHistoryPersistTimer = null;
+    // LiteParser CLI availability: null = unknown, true/false after first check.
+    // When true, structured OCR rows are stored in memory metadata.
+    // When false, falls back to Tesseract flat text only (existing behavior).
+    this._litAvailable = null;
     this._loadAppHistory();
   }
 
@@ -196,6 +202,68 @@ class MonitorService extends EventEmitter {
       };
     }
     return null;
+  }
+
+  // ── LiteParser structured OCR (progressive enhancement) ──────────────────
+  // If the `lit` CLI is available, we run LiteParser on each screenshot to get
+  // structured rows (with positions + types) and store them in memory metadata.
+  // If LiteParser is not available, we fall back to Tesseract flat text only.
+
+  _checkLiteParserAvailable() {
+    if (this._litAvailable !== null) return this._litAvailable;
+    try {
+      execSync('which lit', { timeout: 2000, stdio: 'pipe' });
+      this._litAvailable = true;
+      logger.info('[monitorService] LiteParser CLI (lit) available — structured OCR enabled');
+    } catch (_) {
+      this._litAvailable = false;
+      logger.info('[monitorService] LiteParser CLI (lit) not available — falling back to Tesseract only');
+    }
+    return this._litAvailable;
+  }
+
+  async _captureStructuredItems(screenshotBuffer) {
+    if (!this._checkLiteParserAvailable()) return [];
+
+    try {
+      const tmpPath = path.join(os.tmpdir(), `monitor-${Date.now()}.png`);
+      fs.writeFileSync(tmpPath, screenshotBuffer);
+
+      const outputFile = path.join(os.tmpdir(), `monitor-liteparse-${Date.now()}.json`);
+      return new Promise((resolve) => {
+        const litProcess = spawn('lit', ['parse', tmpPath, '--format', 'json', '-o', outputFile], { timeout: 30000 });
+        litProcess.on('error', () => {
+          this._litAvailable = false;
+          try { fs.unlinkSync(tmpPath); } catch (_) { /* empty */ }
+          resolve([]);
+        });
+        litProcess.on('close', (code) => {
+          try { fs.unlinkSync(tmpPath); } catch (_) { /* empty */ }
+          if (code !== 0 || !fs.existsSync(outputFile)) { resolve([]); return; }
+          try {
+            const output = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
+            fs.unlinkSync(outputFile);
+            const items = [];
+            (output.pages || []).forEach(page => {
+              (page.textItems || []).forEach(item => {
+                items.push({
+                  text: item.text || '',
+                  x: item.x || 0,
+                  y: item.y || 0,
+                  width: item.width || 0,
+                  height: item.height || 0,
+                  confidence: item.confidence || 1,
+                });
+              });
+            });
+            resolve(items);
+          } catch (_) { resolve([]); }
+        });
+      });
+    } catch (e) {
+      logger.debug(`[monitorService] _captureStructuredItems failed: ${e.message}`);
+      return [];
+    }
   }
 
   /**
@@ -407,7 +475,7 @@ class MonitorService extends EventEmitter {
       }
 
       // Step 6: Generate embedding and store
-      await this.storeCapture(appName, windowTitle, ocrResult, url);
+      await this.storeCapture(appName, windowTitle, ocrResult, url, screenshotBuffer, bounds);
       this.captureCount++;
 
       // Step 7: Check active watch modes — fire callbacks if new content detected
@@ -587,7 +655,7 @@ class MonitorService extends EventEmitter {
     }).catch(() => {});
   }
 
-  async storeCapture(appName, windowTitle, ocrResult, url = null) {
+  async storeCapture(appName, windowTitle, ocrResult, url = null, screenshotBuffer = null, bounds = null) {
     const memoryId = generateMemoryId();
     const userId = process.env.MONITOR_USER_ID || 'local_user';
 
@@ -607,6 +675,15 @@ class MonitorService extends EventEmitter {
       logger.info('[monitorService] Overlay detected in capture — flagging as tainted', { appName, windowTitle });
     }
 
+    // Capture structured items via LiteParser (best-effort, falls back to empty)
+    let structuredRows = [];
+    if (screenshotBuffer) {
+      const textItems = await this._captureStructuredItems(screenshotBuffer);
+      if (textItems.length > 0) {
+        structuredRows = structureOcrOverlayItems(textItems);
+      }
+    }
+
     // Build metadata with extracted files, code snippets, and OCR stats
     const category = KNOWN_APPS[appName] || 'other';
     const metadata = JSON.stringify({
@@ -614,13 +691,16 @@ class MonitorService extends EventEmitter {
       windowTitle,
       category,
       ...(url ? { url } : {}),
+      ...(bounds ? { bounds } : {}),
       ocrConfidence: ocrResult.confidence,
       ocrRawLength: ocrResult.text.length,
       cleanedLength: processed.filteredText.length,
       files: processed.files,
       codeSnippets: processed.codeSnippets,
       capturedAt: new Date().toISOString(),
-      ...(overlayTainted ? { overlayTainted: true } : {})
+      ...(overlayTainted ? { overlayTainted: true } : {}),
+      // Structured rows with positions + types (empty if LiteParser unavailable)
+      ...(structuredRows.length > 0 ? { structuredRows: structuredRows.slice(0, 100) } : {}),
     });
 
     // source_text = cleaned text for embedding/search

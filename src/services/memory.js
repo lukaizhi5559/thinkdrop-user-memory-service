@@ -1177,6 +1177,7 @@ class MemoryService {
         windowTitle: metadata.windowTitle || 'unknown',
         category: metadata.category || 'other',
         url: metadata.url || null,
+        bounds: metadata.bounds || null,
         files: metadata.files || [],
         codeSnippets: metadata.codeSnippets || [],
         ocrConfidence: metadata.ocrConfidence || null,
