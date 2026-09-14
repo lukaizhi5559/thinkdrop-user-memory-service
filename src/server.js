@@ -225,8 +225,20 @@ app.get('/service.capabilities', (req, res) => {
         },
         {
           name: 'memory.getPreviousActiveApp',
-          description: 'Get the last non-overlay app the user was in before switching to ThinkDrop',
+          description: 'Get the last non-overlay app the user was in before switching to ThinkDrop (history fallback — prefer memory.getActiveAppContext)',
           inputSchema: {}
+        },
+        {
+          name: 'memory.getActiveAppContext',
+          description: 'Canonical active-app context resolver. Live-first: returns the current active app + open file path, falling back to the previous non-overlay app when ThinkDrop/voice-companion is frontmost. Use for "the file that\'s open" / "close this app" / "what app am I using" / etc.',
+          inputSchema: {}
+        },
+        {
+          name: 'memory.getAppUsageSummary',
+          description: 'Per-app usage durations computed from app-history switch timestamps. Use for "how long I\'ve been in X" / "list apps I used today with time".',
+          inputSchema: {
+            maxAgeHours: 'number (optional, default: 24)'
+          }
         }
       ],
       features: [
@@ -333,6 +345,8 @@ async function startServer() {
       console.log('   - POST /memory.getRecentOcr');
       console.log('   - POST /memory.getAppHistory');
       console.log('   - POST /memory.getPreviousActiveApp');
+      console.log('   - POST /memory.getActiveAppContext');
+      console.log('   - POST /memory.getAppUsageSummary');
       console.log('   - POST /personality.getState');
       console.log('   - POST /personality.event');
       console.log('   - POST /personality.resetState');

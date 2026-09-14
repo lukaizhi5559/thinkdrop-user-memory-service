@@ -100,6 +100,8 @@ class MonitorService extends EventEmitter {
     this.idleTimeout = parseInt(process.env.SCREEN_CAPTURE_IDLE_TIMEOUT || '300000', 10);
     this.lastAppName = null;
     this.lastWindowTitle = null;
+    this.lastUrl = null;
+    this.lastFilePath = null;
     this.captureCount = 0;
     this.skipCount = 0;
     this.errorCount = 0;
@@ -111,6 +113,8 @@ class MonitorService extends EventEmitter {
     // The last non-overlay app the user was in before switching to ThinkDrop.
     // Used by getRecentOcr to prefer captures from the app the user was actually looking at.
     this.lastNonOverlayApp = null;
+    // The open file path of the last non-overlay app (authoritative when available).
+    this.lastNonOverlayFilePath = null;
     // Phase 2: Track screen dimensions for resize detection
     this.lastScreenWidth = 0;
     this.lastScreenHeight = 0;
@@ -159,11 +163,13 @@ class MonitorService extends EventEmitter {
     }, 2000);
   }
 
-  _recordAppSwitch(appName, windowTitle, bounds, url) {
+  _recordAppSwitch(appName, windowTitle, bounds, url, filePath) {
     if (!appName) return;
-    // Dedupe consecutive same-app entries
     const last = this.appHistory[this.appHistory.length - 1];
-    if (last && last.appName === appName) return;
+    // Dedupe consecutive same-app + same-file entries.
+    // A new entry IS pushed when the same app opens a different file —
+    // file-open events within the same app must be captured.
+    if (last && last.appName === appName && (last.filePath || null) === (filePath || null)) return;
     const entry = {
       appName,
       category: KNOWN_APPS[appName] || 'other',
@@ -171,11 +177,49 @@ class MonitorService extends EventEmitter {
       bounds: bounds || null,
       timestamp: new Date().toISOString(),
       url: url || null,
+      filePath: filePath || null,
     };
     this.appHistory.push(entry);
     // Cap at 500 entries per day
     if (this.appHistory.length > 500) this.appHistory.shift();
     this._persistAppHistory();
+  }
+
+  /**
+   * Skip-list helper: overlay apps + the voice companion Chrome window.
+   * The voice companion is a separate Chrome window (shell.openExternal to
+   * localhost:5173?mode=voice-companion) that steals focus when opened.
+   * Detected by appName === 'Google Chrome' && url?.includes('voice-companion').
+   * @param {string} appName
+   * @param {string|null} url
+   * @returns {boolean}
+   */
+  _isSkipApp(appName, url) {
+    if (!appName) return true;
+    // ThinkDrop overlay + Electron
+    if (['Electron', 'ThinkDrop'].some(s => appName.includes(s))) return true;
+    // Voice companion Chrome window — detected by URL
+    if (appName === 'Google Chrome' && url && /mode=voice-companion/.test(url)) return true;
+    // Transient/system pseudo-apps — get-windows returns these during lock
+    // screen, notification center, or transient failures. They pollute
+    // appHistory and corrupt lastNonOverlayApp. isSystemIdle gates true idle;
+    // this covers the first minutes post-lock and transient get-windows hiccups.
+    if (appName === 'unknown') return true;
+    const SYSTEM_PSEUDO_APPS = new Set([
+      'loginwindow', 'UserNotificationCenter', 'WindowManager', 'Dock',
+      'Control Center', 'Notification Center', 'Spotlight',
+    ]);
+    if (SYSTEM_PSEUDO_APPS.has(appName)) return true;
+    return false;
+  }
+
+  /**
+   * Resolve the category for an app name (browser/editor/chat/design/terminal/email/other).
+   * @param {string} appName
+   * @returns {string}
+   */
+  _getCategory(appName) {
+    return KNOWN_APPS[appName] || 'other';
   }
 
   getAppHistory({ maxAgeHours = 24 } = {}) {
@@ -184,11 +228,10 @@ class MonitorService extends EventEmitter {
   }
 
   getPreviousActiveApp() {
-    // Find the last non-overlay app entry from history
-    const SKIP_APPS = ['Electron', 'ThinkDrop'];
+    // Find the last non-overlay app entry from history (skips voice companion too)
     for (let i = this.appHistory.length - 1; i >= 0; i--) {
       const e = this.appHistory[i];
-      if (!SKIP_APPS.some(s => e.appName?.includes(s))) return e;
+      if (!this._isSkipApp(e.appName, e.url)) return e;
     }
     // Fallback to lastNonOverlayApp
     if (this.lastNonOverlayApp) {
@@ -199,6 +242,7 @@ class MonitorService extends EventEmitter {
         bounds: null,
         timestamp: new Date().toISOString(),
         url: null,
+        filePath: this.lastNonOverlayFilePath || null,
       };
     }
     return null;
@@ -288,7 +332,8 @@ class MonitorService extends EventEmitter {
         const _saved = JSON.parse(fs.readFileSync(_stateFile, 'utf8'));
         if (_saved?.lastNonOverlayApp) {
           this.lastNonOverlayApp = _saved.lastNonOverlayApp;
-          logger.info(`[monitorService] Cold-start: restored lastNonOverlayApp = "${this.lastNonOverlayApp}" (from state file)`);
+          this.lastNonOverlayFilePath = _saved.lastNonOverlayFilePath || null;
+          logger.info(`[monitorService] Cold-start: restored lastNonOverlayApp = "${this.lastNonOverlayApp}" (from state file)${this.lastNonOverlayFilePath ? ` filePath="${this.lastNonOverlayFilePath}"` : ''}`);
         }
       }
     } catch (_) { /* state file unreadable — fall through to DB */ }
@@ -296,7 +341,8 @@ class MonitorService extends EventEmitter {
     if (!this.lastNonOverlayApp) {
       try {
         const seedRows = await this.db.query(`
-          SELECT json_extract_string(metadata, '$.appName') as appName
+          SELECT json_extract_string(metadata, '$.appName') as appName,
+                 json_extract_string(metadata, '$.filePath') as filePath
           FROM episodic_memory
           WHERE type = 'screen_capture'
             AND json_extract_string(metadata, '$.appName') NOT IN ('Electron', 'ThinkDrop', 'unknown')
@@ -307,7 +353,8 @@ class MonitorService extends EventEmitter {
         `);
         if (seedRows?.length > 0 && seedRows[0].appName) {
           this.lastNonOverlayApp = seedRows[0].appName;
-          logger.info(`[monitorService] Cold-start: seeded lastNonOverlayApp = "${this.lastNonOverlayApp}" (from DB)`);
+          this.lastNonOverlayFilePath = seedRows[0].filePath || null;
+          logger.info(`[monitorService] Cold-start: seeded lastNonOverlayApp = "${this.lastNonOverlayApp}" (from DB)${this.lastNonOverlayFilePath ? ` filePath="${this.lastNonOverlayFilePath}"` : ''}`);
         }
       } catch (seedErr) {
         logger.debug(`[monitorService] Cold-start DB seed skipped: ${seedErr.message}`);
@@ -377,44 +424,47 @@ class MonitorService extends EventEmitter {
       }
 
       // Step 2: Get active window — cheap on same-app ticks via cached result
-      const { appName, windowTitle, url, bounds } = await getActiveWindow();
+      const { appName, windowTitle, url, bounds, filePath } = await getActiveWindow();
 
-      // Skip if the active app is the ThinkDrop overlay itself
-      const SKIP_APPS = ['Electron', 'ThinkDrop'];
-      if (SKIP_APPS.some(skip => appName?.includes(skip))) {
+      // Skip if the active app is the ThinkDrop overlay or the voice companion Chrome window
+      if (this._isSkipApp(appName, url)) {
         // Record the last real (non-overlay) app so getRecentOcr can prefer it.
         // This captures the app the user was looking at before opening ThinkDrop.
-        if (this.lastAppName && !SKIP_APPS.some(s => this.lastAppName?.includes(s))) {
+        if (this.lastAppName && !this._isSkipApp(this.lastAppName, this.lastUrl)) {
           this.lastNonOverlayApp = this.lastAppName;
+          this.lastNonOverlayFilePath = this.lastFilePath || null;
           // Persist to disk so it survives service restarts.
           try {
             const _stateDir = path.join(os.homedir(), '.thinkdrop');
             if (!fs.existsSync(_stateDir)) fs.mkdirSync(_stateDir, { recursive: true });
             fs.writeFileSync(path.join(_stateDir, 'monitor-state.json'),
-              JSON.stringify({ lastNonOverlayApp: this.lastNonOverlayApp, ts: new Date().toISOString() }));
+              JSON.stringify({ lastNonOverlayApp: this.lastNonOverlayApp, lastNonOverlayFilePath: this.lastNonOverlayFilePath, ts: new Date().toISOString() }));
           } catch (_) { /* non-fatal — persist best-effort */ }
         }
         this.skipCount++;
         return;
       }
 
-      // Step 3: Check if window context changed
+      // Step 3: Check if window context changed (app, title, or open file path)
       const titleChanged = appName !== this.lastAppName || windowTitle !== this.lastWindowTitle;
-      if (titleChanged && appName) {
+      const filePathChanged = (filePath || null) !== (this.lastFilePath || null);
+      if ((titleChanged || filePathChanged) && appName) {
         // Phase 2: Invalidate previous app's boundary cache before switching
         if (this.lastAppName) {
           this._invalidateBoundaryCache(this.lastAppName, this.lastWindowTitle);
         }
         this._enqueueAppEnrichment(appName, windowTitle);
         // Event-driven heartbeat: emit app_change for subscribers (e.g. heartbeat.cjs)
-        this.emit('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName });
+        this.emit('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName, filePath });
         // Notify personality-service (cross-process) to trigger event-driven Tier 2
         notifyPersonalityService('app_change', { app: appName, title: windowTitle, previousApp: this.lastAppName });
-        // ── App-Flow: record app switch in active-app-history ──
-        this._recordAppSwitch(appName, windowTitle, bounds, url);
+        // ── App-Flow: record app switch (or file-open within same app) ──
+        this._recordAppSwitch(appName, windowTitle, bounds, url, filePath);
       }
       this.lastAppName = appName;
       this.lastWindowTitle = windowTitle;
+      this.lastUrl = url;
+      this.lastFilePath = filePath || null;
 
       let screenshotBuffer;
 
@@ -475,7 +525,7 @@ class MonitorService extends EventEmitter {
       }
 
       // Step 6: Generate embedding and store
-      await this.storeCapture(appName, windowTitle, ocrResult, url, screenshotBuffer, bounds);
+      await this.storeCapture(appName, windowTitle, ocrResult, url, screenshotBuffer, bounds, filePath);
       this.captureCount++;
 
       // Step 7: Check active watch modes — fire callbacks if new content detected
@@ -655,7 +705,7 @@ class MonitorService extends EventEmitter {
     }).catch(() => {});
   }
 
-  async storeCapture(appName, windowTitle, ocrResult, url = null, screenshotBuffer = null, bounds = null) {
+  async storeCapture(appName, windowTitle, ocrResult, url = null, screenshotBuffer = null, bounds = null, filePath = null) {
     const memoryId = generateMemoryId();
     const userId = process.env.MONITOR_USER_ID || 'local_user';
 
@@ -692,6 +742,7 @@ class MonitorService extends EventEmitter {
       category,
       ...(url ? { url } : {}),
       ...(bounds ? { bounds } : {}),
+      ...(filePath ? { filePath } : {}),
       ocrConfidence: ocrResult.confidence,
       ocrRawLength: ocrResult.text.length,
       cleanedLength: processed.filteredText.length,
