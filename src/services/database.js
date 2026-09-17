@@ -56,35 +56,47 @@ class DatabaseService {
       logger.info(`Created database directory: ${dir}`);
     }
 
-    // Clean up WAL files from previous crashes to prevent corruption
-    try {
-      const walPath = this.dbPath + '.wal';
-      if (fs.existsSync(walPath)) {
-        logger.info('Removing stale WAL file from previous crash', { walPath });
-        fs.unlinkSync(walPath);
-      }
-      // Also check for temp files
-      const tempPath = this.dbPath + '.tmp';
-      if (fs.existsSync(tempPath)) {
-        logger.info('Removing stale temp file from previous crash', { tempPath });
-        fs.unlinkSync(tempPath);
-      }
-    } catch (cleanupErr) {
-      logger.warn('Failed to cleanup stale database files', { error: cleanupErr.message });
-    }
-
+    // WAL handling: try to connect FIRST so DuckDB can replay the WAL normally.
+    // Only if open fails do we quarantine the WAL — renamed to .bak (not deleted)
+    // so un-checkpointed writes remain recoverable for forensics.
     const MAX_RETRIES = 5;
     const RETRY_DELAY_MS = 3000;
+    let walQuarantined = false;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         await this._tryConnect();
         return;
       } catch (err) {
-        const isLockError = err.message && err.message.includes('Could not set lock');
+        const msg = err.message || '';
+        const isLockError = msg.includes('Could not set lock');
+        const isWalError = !isLockError && !walQuarantined &&
+          (msg.includes('wal') || msg.includes('WAL') || msg.includes('replay') ||
+           msg.includes('GetDefaultDatabase') || msg.includes('InternalException'));
+
+        if (isWalError) {
+          // WAL replay crashed — quarantine it and retry once. DuckDB will open
+          // from the last checkpoint; writes since then are preserved in .bak.
+          walQuarantined = true;
+          try {
+            const walPath = this.dbPath + '.wal';
+            if (fs.existsSync(walPath)) {
+              const bakPath = `${walPath}.bak-${Date.now()}`;
+              fs.renameSync(walPath, bakPath);
+              logger.warn('Quarantined un-replayable WAL file (recoverable)', { bakPath });
+              this._pruneWalBackups();
+            }
+            const tempPath = this.dbPath + '.tmp';
+            if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+          } catch (qErr) {
+            logger.warn('Failed to quarantine WAL file', { error: qErr.message });
+          }
+          continue;
+        }
+
         if (isLockError && attempt < MAX_RETRIES) {
           logger.warn(`Database locked by another process (attempt ${attempt}/${MAX_RETRIES}). Retrying in ${RETRY_DELAY_MS / 1000}s...`, {
-            error: err.message.split('\n')[0]
+            error: msg.split('\n')[0]
           });
           await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
         } else {
@@ -92,6 +104,26 @@ class DatabaseService {
           throw err;
         }
       }
+    }
+  }
+
+  /**
+   * Keep only the newest N quarantined WAL backups so they don't accumulate.
+   */
+  _pruneWalBackups(keep = 5) {
+    try {
+      const dir = path.dirname(this.dbPath);
+      const base = path.basename(this.dbPath) + '.wal.bak-';
+      const backups = fs.readdirSync(dir)
+        .filter(f => f.startsWith(base))
+        .sort()
+        .reverse();
+      for (const f of backups.slice(keep)) {
+        fs.unlinkSync(path.join(dir, f));
+        logger.info('Pruned old WAL backup', { file: f });
+      }
+    } catch (e) {
+      logger.warn('Failed to prune WAL backups', { error: e.message });
     }
   }
 
@@ -122,15 +154,16 @@ class DatabaseService {
             // Install FTS extension for BM25 keyword search (load deferred to first search)
             await this.initFts();
 
-            // Migrate existing screen captures into the new episodic_memory table
-            await this.migrateScreenCapturesToEpisodic();
-
             this.isInitialized = true;
             logger.info(`Database initialized successfully: ${this.dbPath}`);
             
             // Start proactive health checks to detect corruption early
             this.startHealthCheck();
-            
+
+            // Periodic WAL checkpoint — keeps the WAL small so crash replay is
+            // fast and the quarantine path is rarely needed
+            this.startCheckpointTimer();
+
             resolve();
           } catch (error) {
             reject(error);
@@ -156,7 +189,6 @@ class DatabaseService {
           type TEXT DEFAULT 'user_memory',
           source_text TEXT,
           metadata TEXT,
-          screenshot TEXT,
           extracted_text TEXT,
           embedding FLOAT[384],
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -187,9 +219,7 @@ class DatabaseService {
           type TEXT DEFAULT 'screen_capture',
           source_text TEXT,
           metadata TEXT,
-          screenshot TEXT,
           extracted_text TEXT,
-          embedding FLOAT[384],
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -306,55 +336,75 @@ class DatabaseService {
       } catch (e) { /* Column exists */ }
       logger.info('Context_rules migration complete');
 
-      // Create api_rules table for per-service API contract rules used by skill generation pipeline
-      // service:   npm/API service name (e.g. 'clicksend', 'twilio', 'stripe', 'gmail')
-      // rule_type: 'auth' | 'payload' | 'secret' | 'endpoint' | 'gotcha'
-      // code_pattern: optional regex string to detect violations in generated skill code
-      // fix_hint:     exact correction to give the LLM when violation is found
-      // source:       'system' (seed rules) | 'learned' (written from runtime failures)
-      logger.info('Creating api_rules table...');
-      await this.run(`
-        CREATE TABLE IF NOT EXISTS api_rules (
-          id TEXT PRIMARY KEY,
-          service TEXT NOT NULL,
-          rule_type TEXT NOT NULL DEFAULT 'gotcha',
-          rule_text TEXT NOT NULL,
-          code_pattern TEXT,
-          fix_hint TEXT,
-          source TEXT DEFAULT 'system',
-          hit_count INTEGER DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_service ON api_rules(service)');
-      await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_type ON api_rules(rule_type)');
-      await this.run('CREATE INDEX IF NOT EXISTS idx_api_rules_source ON api_rules(source)');
-      logger.info('Api_rules table created');
-      await this.seedApiRules();
       await this.seedContextRules();
 
-      // Create intent_overrides table for user-corrected intent learning.
-      // When the user corrects a wrong classification ("no, I meant go to the webpage"),
-      // we store the original phrase + correct intent here and check it before phi4
-      // on future prompts — so the same phrasing never misclassifies again.
-      logger.info('Creating intent_overrides table...');
-      await this.run(`
-        CREATE TABLE IF NOT EXISTS intent_overrides (
-          id TEXT PRIMARY KEY,
-          example_prompt TEXT NOT NULL,
-          correct_intent TEXT NOT NULL,
-          wrong_intent TEXT,
-          embedding FLOAT[384],
-          source TEXT DEFAULT 'user_correction',
-          hit_count INTEGER DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await this.run('CREATE INDEX IF NOT EXISTS idx_intent_overrides_intent ON intent_overrides(correct_intent)');
-      await this.run('CREATE INDEX IF NOT EXISTS idx_intent_overrides_created ON intent_overrides(created_at)');
-      logger.info('Intent_overrides table created');
+      // ── Schema slimming (one-time, idempotent) ────────────────────────────
+      // episodic_memory.embedding: write-only column — episodic search is pure
+      //   BM25+filters and never reads it; dropping also removes per-capture
+      //   embedding compute cost.
+      // screenshot columns: never populated by any writer (0 rows).
+      // api_rules / intent_overrides: retired (skill-pipeline removed upstream;
+      //   intent_override reader was deleted with parseIntent.js).
+      // Gate: only run when the legacy columns/tables still exist — dropping
+      // the FTS index forces a rebuild, so this must not run on every boot.
+      const slimmingNeeded = await this.all(`
+        SELECT COUNT(*) AS n FROM information_schema.columns
+        WHERE (table_name = 'episodic_memory' AND column_name IN ('embedding', 'screenshot'))
+           OR (table_name = 'memory' AND column_name = 'screenshot')
+      `).then(r => Number(r[0]?.n || 0) > 0).catch(() => false);
+      const retiredTables = await this.all(`
+        SELECT COUNT(*) AS n FROM information_schema.tables
+        WHERE table_name IN ('api_rules', 'intent_overrides')
+      `).then(r => Number(r[0]?.n || 0) > 0).catch(() => false);
+
+      if (slimmingNeeded || retiredTables) {
+        logger.info('Running schema slimming migration...');
+        // DuckDB refuses to ALTER a table while ANY secondary index or the FTS
+        // index (fts_main_*) depends on it — drop them all first, then recreate.
+        // FTS is also recreated lazily by ensureFtsLoaded() on first search.
+        for (const stmt of [
+          'LOAD fts',
+          'PRAGMA drop_fts_index(\'episodic_memory\')',
+          'PRAGMA drop_fts_index(\'memory\')',
+          'DROP INDEX IF EXISTS idx_episodic_user_id',
+          'DROP INDEX IF EXISTS idx_episodic_type',
+          'DROP INDEX IF EXISTS idx_episodic_created_at',
+          'DROP INDEX IF EXISTS idx_episodic_user_created',
+          'DROP INDEX IF EXISTS idx_episodic_user_type_created',
+          'DROP INDEX IF EXISTS idx_memory_user_id',
+          'DROP INDEX IF EXISTS idx_memory_type',
+          'DROP INDEX IF EXISTS idx_memory_created_at',
+          'DROP INDEX IF EXISTS idx_memory_user_created',
+          'DROP INDEX IF EXISTS idx_memory_user_type',
+          'DROP INDEX IF EXISTS idx_memory_user_type_created',
+          'ALTER TABLE episodic_memory DROP COLUMN embedding',
+          'ALTER TABLE episodic_memory DROP COLUMN screenshot',
+          'ALTER TABLE memory DROP COLUMN screenshot',
+          'DROP TABLE IF EXISTS api_rules',
+          'DROP TABLE IF EXISTS intent_overrides',
+          'CREATE INDEX IF NOT EXISTS idx_episodic_user_id ON episodic_memory(user_id)',
+          'CREATE INDEX IF NOT EXISTS idx_episodic_type ON episodic_memory(type)',
+          'CREATE INDEX IF NOT EXISTS idx_episodic_created_at ON episodic_memory(created_at)',
+          'CREATE INDEX IF NOT EXISTS idx_episodic_user_created ON episodic_memory(user_id, created_at DESC)',
+          'CREATE INDEX IF NOT EXISTS idx_episodic_user_type_created ON episodic_memory(user_id, type, created_at DESC)',
+          'CREATE INDEX IF NOT EXISTS idx_memory_user_id ON memory(user_id)',
+          'CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type)',
+          'CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory(created_at)',
+          'CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory(user_id, created_at DESC)',
+          'CREATE INDEX IF NOT EXISTS idx_memory_user_type ON memory(user_id, type)',
+          'CREATE INDEX IF NOT EXISTS idx_memory_user_type_created ON memory(user_id, type, created_at DESC)',
+        ]) {
+          try {
+            await this.run(stmt);
+            logger.info(`  + ${stmt}`);
+          } catch (e) {
+            // Column/index may already be gone — that's fine. Anything else
+            // leaves the retry for next boot, so surface it at warn level.
+            logger.warn(`  - migration statement failed (${stmt}): ${e.message.split('\n')[0]}`);
+          }
+        }
+        logger.info('Schema slimming migration complete');
+      }
 
       // Create phrase_preferences table — user-taught phrase→delivery mappings.
       // When the user says something ambiguous like "shoot me a text" or "drop me a message",
@@ -565,242 +615,6 @@ class DatabaseService {
   }
 
   /**
-   * Seed api_rules with known API contract rules on first boot (idempotent).
-   * Only inserts rules that don't already exist for a given service+rule_type+text combo.
-   */
-  async seedApiRules() {
-    const SQ = '\'';
-    const rules = [
-      // ── ClickSend ────────────────────────────────────────────────────────────
-      { service: 'clicksend', rule_type: 'auth',
-        rule_text: 'ClickSend Basic Auth MUST use both username AND API key: Buffer.from(secrets.CLICKSEND_USERNAME + ":" + secrets.CLICKSEND_API_KEY).toString("base64"). Empty username (":" + key) always returns 401 invalid_request.',
-        code_pattern: 'Buffer\\.from\\s*\\([`\'"]+:\\s*[`\'"]*\\$?\\{?\\s*\\w*(?:API_KEY|api_key)',
-        fix_hint: 'Replace Buffer.from(":" + key) with Buffer.from(secrets.CLICKSEND_USERNAME + ":" + secrets.CLICKSEND_API_KEY).toString("base64")' },
-      { service: 'clicksend', rule_type: 'secret',
-        rule_text: 'ClickSend requires TWO secrets: CLICKSEND_USERNAME (account email) AND CLICKSEND_API_KEY. Both must be in the Skill Interface secrets list.',
-        code_pattern: null,
-        fix_hint: 'Add CLICKSEND_USERNAME and CLICKSEND_API_KEY to secrets in plan.md Skill Interface.' },
-      { service: 'clicksend', rule_type: 'payload',
-        rule_text: 'ClickSend SMS POST /v3/sms/send requires: { messages: [{ to, body, source }] }. Flat { to, message } format returns invalid_request.',
-        code_pattern: '"to"\\s*:\\s*(?:secrets|RECIPIENT|phone)(?!.*messages\\s*:)',
-        fix_hint: 'Use: JSON.stringify({ messages: [{ to: secrets.RECIPIENT_PHONE_NUMBER, body: text, source: "thinkdrop" }] })' },
-      { service: 'clicksend', rule_type: 'endpoint',
-        rule_text: 'ClickSend SMS endpoint: POST https://rest.clicksend.com/v3/sms/send with Content-Type: application/json and Authorization: Basic <base64>.',
-        code_pattern: null,
-        fix_hint: 'hostname: "rest.clicksend.com", path: "/v3/sms/send", method: "POST"' },
-      { service: 'clicksend', rule_type: 'gotcha',
-        rule_text: 'npm package "clicksend" is TypeScript-only — require("clicksend") throws at runtime. Use Node.js built-in https to call the REST API directly.',
-        code_pattern: 'require\\s*\\([\'"]{1}clicksend[\'"]{1}\\)',
-        fix_hint: 'Remove require("clicksend"). Call https://rest.clicksend.com/v3/sms/send directly with https.request().' },
-      // ── Twilio ───────────────────────────────────────────────────────────────
-      { service: 'twilio', rule_type: 'auth',
-        rule_text: 'Twilio uses HTTP Basic Auth: Buffer.from(secrets.TWILIO_ACCOUNT_SID + ":" + secrets.TWILIO_AUTH_TOKEN).toString("base64"). SID is username, Auth Token is password.',
-        code_pattern: null,
-        fix_hint: '"Basic " + Buffer.from(secrets.TWILIO_ACCOUNT_SID + ":" + secrets.TWILIO_AUTH_TOKEN).toString("base64")' },
-      { service: 'twilio', rule_type: 'secret',
-        rule_text: 'Twilio requires: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER (sender). All three must be in the secrets list.',
-        code_pattern: null,
-        fix_hint: 'Declare TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER in secrets.' },
-      { service: 'twilio', rule_type: 'payload',
-        rule_text: 'Twilio SMS POST /2010-04-01/Accounts/{SID}/Messages.json requires Content-Type: application/x-www-form-urlencoded body with To, From, Body fields.',
-        code_pattern: null,
-        fix_hint: 'Use new URLSearchParams({ To, From, Body }).toString() with Content-Type: application/x-www-form-urlencoded.' },
-      // ── Gmail ────────────────────────────────────────────────────────────────
-      { service: 'gmail', rule_type: 'auth',
-        rule_text: 'Gmail API uses OAuth2. Required secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN. Use googleapis (ships compiled JS).',
-        code_pattern: null,
-        fix_hint: 'const { google } = require("googleapis"); const auth = new google.auth.OAuth2(clientId, secret, redirect); auth.setCredentials({ refresh_token });' },
-      { service: 'gmail', rule_type: 'secret',
-        rule_text: 'Gmail requires four OAuth secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN.',
-        code_pattern: null,
-        fix_hint: 'Add all four to secrets list.' },
-      { service: 'gmail', rule_type: 'gotcha',
-        rule_text: 'gmail-cli and mail-cli do not exist as real npm packages. Use the googleapis package for Gmail API access.',
-        code_pattern: 'gmail-cli|mail-cli|execSync.*gmail|spawn.*gmail',
-        fix_hint: 'Replace with: const { google } = require("googleapis").' },
-      // ── Stripe ───────────────────────────────────────────────────────────────
-      { service: 'stripe', rule_type: 'auth',
-        rule_text: 'Stripe uses Bearer auth: Authorization: "Bearer " + secrets.STRIPE_SECRET_KEY. The stripe npm package ships compiled CommonJS.',
-        code_pattern: null,
-        fix_hint: 'require("stripe")(secrets.STRIPE_SECRET_KEY) or https with Authorization: "Bearer " + secrets.STRIPE_SECRET_KEY' },
-      { service: 'stripe', rule_type: 'secret',
-        rule_text: 'Stripe requires STRIPE_SECRET_KEY (sk_live_... or sk_test_...). For webhooks also declare STRIPE_WEBHOOK_SECRET.',
-        code_pattern: null,
-        fix_hint: 'Declare STRIPE_SECRET_KEY in secrets.' },
-      // ── SendGrid ─────────────────────────────────────────────────────────────
-      { service: 'sendgrid', rule_type: 'auth',
-        rule_text: 'SendGrid uses Bearer auth: Authorization: "Bearer " + secrets.SENDGRID_API_KEY. Keys start with "SG.".',
-        code_pattern: null,
-        fix_hint: '{ "Authorization": "Bearer " + secrets.SENDGRID_API_KEY, "Content-Type": "application/json" }' },
-      { service: 'sendgrid', rule_type: 'payload',
-        rule_text: 'SendGrid POST /v3/mail/send payload: { personalizations:[{to:[{email}]}], from:{email}, subject, content:[{type:"text/plain",value}] }.',
-        code_pattern: null,
-        fix_hint: 'Payload: { personalizations:[{to:[{email:secrets.TO_EMAIL}]}], from:{email:secrets.FROM_EMAIL}, subject, content:[{type:"text/plain",value}] }' },
-      // ── Slack ────────────────────────────────────────────────────────────────
-      { service: 'slack', rule_type: 'auth',
-        rule_text: 'Slack Web API uses Bearer token: Authorization: "Bearer " + secrets.SLACK_BOT_TOKEN. @slack/web-api ships compiled CommonJS.',
-        code_pattern: null,
-        fix_hint: 'require("@slack/web-api") WebClient(secrets.SLACK_BOT_TOKEN) or https Authorization: "Bearer " + secrets.SLACK_BOT_TOKEN' },
-      { service: 'slack', rule_type: 'secret',
-        rule_text: 'Slack requires SLACK_BOT_TOKEN (xoxb-...) and SLACK_CHANNEL_ID for posting.',
-        code_pattern: null,
-        fix_hint: 'Declare SLACK_BOT_TOKEN and SLACK_CHANNEL_ID in secrets.' },
-      // ── GitHub ───────────────────────────────────────────────────────────────
-      { service: 'github', rule_type: 'auth',
-        rule_text: 'GitHub API: Authorization: "Bearer " + secrets.GITHUB_TOKEN. Personal tokens start with "ghp_", fine-grained with "github_pat_".',
-        code_pattern: null,
-        fix_hint: '{ "Authorization": "Bearer " + secrets.GITHUB_TOKEN, "Accept": "application/vnd.github.v3+json" }' },
-      // ── OpenAI ───────────────────────────────────────────────────────────────
-      { service: 'openai', rule_type: 'auth',
-        rule_text: 'OpenAI API: Authorization: "Bearer " + secrets.OPENAI_API_KEY. Keys start with "sk-".',
-        code_pattern: null,
-        fix_hint: '{ "Authorization": "Bearer " + secrets.OPENAI_API_KEY, "Content-Type": "application/json" }' },
-      // ── Endpoint / Docs URLs ─────────────────────────────────────────────────
-      // These are loaded by planSkills at runtime to inject exact API docs URLs
-      // into the skill generation prompt. Stored in DB so they can grow without
-      // code deploys — any new service can be added via api_rule.upsert.
-      // rule_text = the docs URL. fix_hint = short description of what the URL covers.
-      // SMS / Voice
-      { service: 'twilio',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://www.twilio.com/docs/sms/api/message-resource#create-a-message-resource',
-        fix_hint: 'Twilio SMS send message REST API' },
-      { service: 'clicksend',   rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developers.clicksend.com/docs/rest/v3/#send-sms',
-        fix_hint: 'ClickSend SMS REST API v3' },
-      { service: 'vonage',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developer.vonage.com/api/sms',
-        fix_hint: 'Vonage SMS API' },
-      { service: 'sinch',       rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developers.sinch.com/docs/sms/api-reference',
-        fix_hint: 'Sinch SMS API reference' },
-      { service: 'messagebird', rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developers.messagebird.com/api/sms-messaging/',
-        fix_hint: 'MessageBird SMS API' },
-      { service: 'plivo',       rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://www.plivo.com/docs/sms/api/message/',
-        fix_hint: 'Plivo SMS message API' },
-      // Email
-      { service: 'mailgun',     rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://documentation.mailgun.com/en/latest/api-sending.html',
-        fix_hint: 'Mailgun email sending API' },
-      { service: 'sendgrid',    rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.sendgrid.com/api-reference/mail-send/mail-send',
-        fix_hint: 'SendGrid mail send API' },
-      { service: 'ses',         rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.aws.amazon.com/ses/latest/APIReference/API_SendEmail.html',
-        fix_hint: 'AWS SES SendEmail API' },
-      { service: 'postmark',    rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://postmarkapp.com/developer/api/email-api',
-        fix_hint: 'Postmark email API' },
-      { service: 'resend',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://resend.com/docs/api-reference/emails/send-email',
-        fix_hint: 'Resend email API' },
-      // Push notifications
-      { service: 'pushover',    rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://pushover.net/api',
-        fix_hint: 'Pushover push notification API' },
-      { service: 'pushbullet',  rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.pushbullet.com/#create-push',
-        fix_hint: 'Pushbullet create push API' },
-      { service: 'onesignal',   rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://documentation.onesignal.com/reference/create-notification',
-        fix_hint: 'OneSignal create notification API' },
-      { service: 'firebase',    rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://firebase.google.com/docs/cloud-messaging/send-message',
-        fix_hint: 'Firebase Cloud Messaging send API' },
-      { service: 'gotify',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://gotify.net/docs/msgother',
-        fix_hint: 'Gotify message push API' },
-      { service: 'ntfy',        rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.ntfy.sh/publish/',
-        fix_hint: 'ntfy.sh publish notification API' },
-      // Chat / Collaboration
-      { service: 'slack',       rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://api.slack.com/messaging/webhooks',
-        fix_hint: 'Slack incoming webhooks API' },
-      { service: 'discord',     rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://discord.com/developers/docs/resources/webhook#execute-webhook',
-        fix_hint: 'Discord execute webhook API' },
-      { service: 'telegram',    rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://core.telegram.org/bots/api#sendmessage',
-        fix_hint: 'Telegram Bot API sendMessage' },
-      { service: 'whatsapp',    rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developers.facebook.com/docs/whatsapp/cloud-api/messages',
-        fix_hint: 'WhatsApp Cloud API send messages' },
-      { service: 'teams',       rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/connectors-using',
-        fix_hint: 'Microsoft Teams incoming webhook connector' },
-      { service: 'mattermost',  rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://api.mattermost.com/#tag/posts/operation/CreatePost',
-        fix_hint: 'Mattermost create post API' },
-      // Automation / Webhooks
-      { service: 'zapier',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://zapier.com/developer/documentation/v2/rest-hooks/',
-        fix_hint: 'Zapier REST hooks API' },
-      { service: 'make',        rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://www.make.com/en/help/tools/webhooks',
-        fix_hint: 'Make (Integromat) webhooks' },
-      { service: 'n8n',         rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/',
-        fix_hint: 'n8n webhook node docs' },
-      { service: 'ifttt',       rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://ifttt.com/maker_webhooks',
-        fix_hint: 'IFTTT Maker webhooks' },
-      // Calendar
-      { service: 'googlecalendar', rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developers.google.com/calendar/api/v3/reference/events/insert',
-        fix_hint: 'Google Calendar events insert API' },
-      // Payment
-      { service: 'stripe',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://stripe.com/docs/api/payment_intents/create',
-        fix_hint: 'Stripe create PaymentIntent API' },
-      // DevOps / Project management
-      { service: 'github',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.github.com/en/rest/issues/issues#create-an-issue',
-        fix_hint: 'GitHub REST API create issue' },
-      { service: 'gitlab',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://docs.gitlab.com/ee/api/issues.html#new-issue',
-        fix_hint: 'GitLab Issues API create issue' },
-      { service: 'linear',      rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developers.linear.app/docs/graphql/working-with-the-graphql-api',
-        fix_hint: 'Linear GraphQL API' },
-      { service: 'jira',        rule_type: 'endpoint', code_pattern: null,
-        rule_text: 'https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-post',
-        fix_hint: 'Jira REST API create issue' },
-      // ── Gmail compose UX gotchas ──────────────────────────────────────────────
-      { service: 'gmail', rule_type: 'gotcha',
-        rule_text: 'After typing a recipient email address in Gmail compose To, CC, or BCC field, always press Enter (not Tab or click-away) to confirm the address as a chip. Verify the chip exists (data-hovercard-id element) before clicking Send. If no chip is present after fill, press Enter and re-check.',
-        code_pattern: 'key.*Tab|press.*Tab|keyboard.*Tab',
-        fix_hint: 'Use keyboard.press("Enter") after filling recipient field, then verify document.querySelector("[data-hovercard-id]") exists before proceeding to Send.' },
-    ];
-
-    let seeded = 0;
-    for (const rule of rules) {
-      try {
-        const safeService  = rule.service.replace(/'/g, SQ + SQ);
-        const safeType     = rule.rule_type.replace(/'/g, SQ + SQ);
-        const safeText     = rule.rule_text.replace(/'/g, SQ + SQ);
-        const existing     = await this.all(
-          `SELECT id FROM api_rules WHERE service = '${safeService}' AND rule_type = '${safeType}' AND rule_text = '${safeText}'`
-        );
-        if (existing && existing.length > 0) continue;
-
-        const id          = `ar_seed_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-        const patternVal  = rule.code_pattern ? `'${rule.code_pattern.replace(/'/g, SQ + SQ)}'` : 'NULL';
-        const fixHintVal  = rule.fix_hint     ? `'${rule.fix_hint.replace(/'/g, SQ + SQ)}'`     : 'NULL';
-        await this.run(`
-          INSERT INTO api_rules (id, service, rule_type, rule_text, code_pattern, fix_hint, source, hit_count, created_at, updated_at)
-          VALUES ('${id}','${safeService}','${safeType}','${safeText}',${patternVal},${fixHintVal},'system',0,now(),now())
-        `);
-        seeded++;
-      } catch (e) {
-        logger.warn(`[seedApiRules] Failed to seed ${rule.service}:${rule.rule_type}`, { error: e.message });
-      }
-    }
-    if (seeded > 0) logger.info(`[seedApiRules] Seeded ${seeded} api_rules`);
-  }
-
-  /**
    * Seed system-level context_rules used by the planning pipeline.
    * Idempotent — skips any rule whose rule_text already exists.
    */
@@ -1005,52 +819,6 @@ class DatabaseService {
     } catch (error) {
       logger.warn('VSS LOAD failed — search will use fallback', { error: error.message });
       this.vssEnabled = false;
-    }
-  }
-
-  /**
-   * One-time migration: copy existing screen_capture rows from memory to the
-   * new episodic_memory table. Idempotent — skips rows already present.
-   */
-  async migrateScreenCapturesToEpisodic() {
-    try {
-      const countResult = await this.all(
-        'SELECT COUNT(*) as count FROM memory WHERE type = \'screen_capture\''
-      );
-      const count = Number(countResult?.[0]?.count || 0);
-      if (count === 0) {
-        logger.info('No screen_capture rows to migrate to episodic_memory');
-        return;
-      }
-
-      await this.run(`
-        INSERT INTO episodic_memory (id, user_id, type, source_text, metadata, screenshot, extracted_text, embedding, created_at, updated_at)
-        SELECT id, user_id, type, source_text, metadata, screenshot, extracted_text, embedding, created_at, updated_at
-        FROM memory
-        WHERE type = 'screen_capture'
-          AND id NOT IN (SELECT id FROM episodic_memory)
-      `);
-
-      await this.run(`
-        INSERT INTO episodic_entities (id, memory_id, entity, type, entity_type, normalized_value, created_at)
-        SELECT id, memory_id, entity, type, entity_type, normalized_value, created_at
-        FROM memory_entities
-        WHERE memory_id IN (SELECT id FROM memory WHERE type = 'screen_capture')
-          AND id NOT IN (SELECT id FROM episodic_entities)
-      `);
-
-      // Remove migrated rows from memory so semantic search stays clean
-      await this.run(`
-        DELETE FROM memory_entities
-        WHERE memory_id IN (SELECT id FROM memory WHERE type = 'screen_capture')
-      `);
-      await this.run(`
-        DELETE FROM memory WHERE type = 'screen_capture'
-      `);
-
-      logger.info(`Migrated ${count} screen_capture rows to episodic_memory`);
-    } catch (error) {
-      logger.warn('Screen-capture migration to episodic_memory failed', { error: error.message });
     }
   }
 
@@ -1331,12 +1099,34 @@ class DatabaseService {
   }
 
   /**
+   * Periodic WAL checkpoint every 15 minutes. All writes run through _dbQueue,
+   * so CHECKPOINT cannot race concurrent INSERTs. Keeps the WAL small so crash
+   * replay is fast and bounded.
+   */
+  startCheckpointTimer() {
+    this.stopCheckpointTimer();
+    this.checkpointInterval = setInterval(() => {
+      this.aggressiveWalCleanup();
+    }, 15 * 60 * 1000);
+    this.checkpointInterval.unref?.();
+    logger.info('WAL checkpoint timer started (15min interval)');
+  }
+
+  stopCheckpointTimer() {
+    if (this.checkpointInterval) {
+      clearInterval(this.checkpointInterval);
+      this.checkpointInterval = null;
+    }
+  }
+
+  /**
    * Close database connection
    */
   async close() {
     // Stop health check
     this.stopHealthCheck();
-    
+    this.stopCheckpointTimer();
+
     if (this.connection) {
       try {
         // Checkpoint WAL to persist changes

@@ -66,7 +66,10 @@ export function validateEntity(entity) {
   if (!entity || typeof entity !== 'object') {
     return false;
   }
-  return !!(entity.type && entity.value);
+  return !!(
+    typeof entity.type === 'string' && entity.type.trim() &&
+    typeof entity.value === 'string' && entity.value.trim()
+  );
 }
 
 /**

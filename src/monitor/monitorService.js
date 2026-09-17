@@ -2,7 +2,6 @@ import { getActiveWindow, isSystemIdle } from './activeWindow.js';
 import { getScreenCaptureService } from './screenCapture.js';
 import OCRService, { getOCRService } from './ocrService.js';
 import { getDatabaseService } from '../services/database.js';
-import { getEmbeddingService } from '../services/embeddings.js';
 import { generateMemoryId } from '../utils/helpers.js';
 import { structureOcrOverlayItems } from '../utils/ocrStructure.js';
 import logger from '../utils/logger.js';
@@ -108,7 +107,6 @@ class MonitorService extends EventEmitter {
     this.screenCapture = getScreenCaptureService();
     this.ocr = getOCRService();
     this.db = getDatabaseService();
-    this.embeddings = getEmbeddingService();
     this._watchModes = new Map();
     // The last non-overlay app the user was in before switching to ThinkDrop.
     // Used by getRecentOcr to prefer captures from the app the user was actually looking at.
@@ -413,7 +411,7 @@ class MonitorService extends EventEmitter {
    *   3. Title changed? → capture
    *   4. Title same? → pixel diff → capture if >threshold
    *   5. OCR → text hash dedup
-   *   6. Generate embedding → store
+   *   6. Store episodic capture
    */
   async tick() {
     try {
@@ -481,10 +479,10 @@ class MonitorService extends EventEmitter {
         await this.screenCapture.computeDiff(screenshotBuffer);
       } else {
         // Step 4: Same window — take screenshot and run pixel diff
-        // Only proceed to OCR+embedding if content visually changed
+        // Only proceed to OCR+store if content visually changed
         const { changed, diffRatio, buffer } = await this.screenCapture.captureIfChanged();
         if (!changed) {
-          // Screen unchanged — skip OCR and embedding entirely
+          // Screen unchanged — skip OCR and store entirely
           this.skipCount++;
           return;
         }
@@ -524,7 +522,7 @@ class MonitorService extends EventEmitter {
         logger.info(`[monitorService] App switched to "${appName}" — bypassing text-hash dedup to anchor new app in DB`);
       }
 
-      // Step 6: Generate embedding and store
+      // Step 6: Store episodic capture
       await this.storeCapture(appName, windowTitle, ocrResult, url, screenshotBuffer, bounds, filePath);
       this.captureCount++;
 
@@ -712,12 +710,10 @@ class MonitorService extends EventEmitter {
     // Process raw OCR text through cleanup pipeline
     const processed = OCRService.processOcrOutput(ocrResult.text);
 
-    // Build embedding text from cleaned output
-    const embeddingText = OCRService.summarizeForEmbedding(appName, windowTitle, processed);
-
-    // Generate embedding
-    const embedding = await this.embeddings.generateEmbedding(embeddingText);
-    const embeddingValues = embedding.map(v => v.toString()).join(',');
+    // Build the searchable text from cleaned output. Stored as source_text and
+    // indexed by the FTS extension for BM25 search — no vector embedding is
+    // generated for episodic rows (episodic search is BM25+filters only).
+    const searchText = OCRService.summarizeForEmbedding(appName, windowTitle, processed);
 
     // Detect whether the captured image contains the ThinkDrop overlay
     const overlayTainted = isOverlayTainted(processed.filteredText) || isOverlayTainted(ocrResult.text);
@@ -759,15 +755,14 @@ class MonitorService extends EventEmitter {
     const sql = `
       INSERT INTO episodic_memory (
         id, user_id, type, source_text, metadata,
-        extracted_text, embedding, created_at, updated_at
+        extracted_text, created_at, updated_at
       ) VALUES (
         '${memoryId}',
         '${userId}',
         'screen_capture',
-        '${embeddingText.replace(/'/g, '\'\'')}',
+        '${searchText.replace(/'/g, '\'\'')}',
         '${metadata.replace(/'/g, '\'\'')}',
         '${processed.filteredText.replace(/'/g, '\'\'')}',
-        list_value(${embeddingValues}),
         now(),
         now()
       )
@@ -775,16 +770,13 @@ class MonitorService extends EventEmitter {
 
     await this.db.execute(sql);
 
-    // Store entities: app name, window title, and extracted file names
+    // Store entities: app name and window title only. FILE entities were dropped
+    // — they were ~57% of episodic_entities rows but only used for per-result
+    // enrichment; file names remain in metadata.files for keyword search.
     const entities = [
       { type: 'application', value: appName, entity_type: 'APP' },
       { type: 'window', value: windowTitle.substring(0, 255), entity_type: 'WINDOW_TITLE' }
     ];
-
-    // Add extracted file names as entities for searchability
-    for (const file of processed.files.slice(0, 10)) {
-      entities.push({ type: 'file', value: file, entity_type: 'FILE' });
-    }
 
     for (const entity of entities) {
       const entityId = `ent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;

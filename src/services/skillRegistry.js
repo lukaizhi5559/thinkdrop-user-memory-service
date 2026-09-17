@@ -171,30 +171,11 @@ class SkillRegistryService {
 
     const safe = (s) => s.replace(/'/g, SQ + SQ);
 
-    // Check if already installed — update if so
-    const existing = await this.db.query(
-      `SELECT id FROM installed_skills WHERE name = '${safe(name)}'`
-    );
-
-    if (existing.length > 0) {
-      const id = existing[0].id;
-      await this.db.execute(`
-        UPDATE installed_skills
-        SET description  = '${safe(description)}',
-            contract_md  = '${safe(contractMd)}',
-            exec_path    = '${safe(exec_path)}',
-            exec_type    = '${safe(exec_type)}',
-            enabled      = true,
-            updated_at   = now()
-        WHERE id = '${id}'
-      `);
-      logger.info(`[SkillRegistry] Updated skill: ${name} (${id})`);
-      await this._upsertHealth(name, 'ok', null);
-      return { id, name, created: false };
-    }
-
+    // Atomic upsert — a check-then-insert pair races when two installs run
+    // concurrently (the await between SELECT and INSERT interleaves), which is
+    // what produced the "Duplicate key name" violations.
     const id = generateId();
-    await this.db.execute(`
+    const rows = await this.db.query(`
       INSERT INTO installed_skills (id, name, description, contract_md, exec_path, exec_type, enabled, installed_at, updated_at)
       VALUES (
         '${id}',
@@ -207,10 +188,21 @@ class SkillRegistryService {
         now(),
         now()
       )
+      ON CONFLICT (name) DO UPDATE SET
+        description = excluded.description,
+        contract_md = excluded.contract_md,
+        exec_path   = excluded.exec_path,
+        exec_type   = excluded.exec_type,
+        enabled     = true,
+        updated_at  = now()
+      RETURNING id
     `);
-    logger.info(`[SkillRegistry] Installed new skill: ${name} (${id})`);
+    const created = rows?.[0]?.id === id;
+    const finalId = rows?.[0]?.id || id;
+
+    logger.info(`[SkillRegistry] ${created ? 'Installed new' : 'Updated'} skill: ${name} (${finalId})`);
     await this._upsertHealth(name, 'ok', null);
-    return { id, name, created: true };
+    return { id: finalId, name, created };
   }
 
   /**
@@ -351,30 +343,10 @@ class SkillRegistryService {
 
     const safe = (s) => String(s).replace(/'/g, SQ + SQ);
     const safeOrNull = (s) => s ? `'${safe(s)}'` : 'NULL';
-    const existing = await this.db.query(
-      `SELECT id FROM installed_skills WHERE name = '${safe(name)}'`
-    );
 
-    if (existing.length > 0) {
-      const id = existing[0].id;
-      await this.db.execute(`
-        UPDATE installed_skills
-        SET description   = '${safe(description || '')}',
-            exec_path     = '${safe(resolvedPath)}',
-            exec_type     = '${safe(execType)}',
-            contract_md   = '${safe(contractMd || '')}',
-            enabled       = ${enabled ? 'true' : 'false'},
-            source_domain = ${safeOrNull(sourceDomain)},
-            source_action = ${safeOrNull(sourceAction)},
-            updated_at    = now()
-        WHERE id = '${id}'
-      `);
-      logger.info(`[SkillRegistry] Upserted (updated) skill: ${name}`);
-      return { id, name, created: false };
-    }
-
+    // Atomic upsert (see install() — check-then-insert races under concurrency).
     const id = generateId();
-    await this.db.execute(`
+    const rows = await this.db.query(`
       INSERT INTO installed_skills (id, name, description, contract_md, exec_path, exec_type, enabled, source_domain, source_action, installed_at, updated_at)
       VALUES (
         '${id}',
@@ -389,9 +361,22 @@ class SkillRegistryService {
         now(),
         now()
       )
+      ON CONFLICT (name) DO UPDATE SET
+        description   = excluded.description,
+        contract_md   = excluded.contract_md,
+        exec_path     = excluded.exec_path,
+        exec_type     = excluded.exec_type,
+        enabled       = excluded.enabled,
+        source_domain = excluded.source_domain,
+        source_action = excluded.source_action,
+        updated_at    = now()
+      RETURNING id
     `);
-    logger.info(`[SkillRegistry] Upserted (inserted) skill: ${name}`);
-    return { id, name, created: true };
+    const created = rows?.[0]?.id === id;
+    const finalId = rows?.[0]?.id || id;
+
+    logger.info(`[SkillRegistry] Upserted (${created ? 'inserted' : 'updated'}) skill: ${name}`);
+    return { id: finalId, name, created };
   }
 
   /**

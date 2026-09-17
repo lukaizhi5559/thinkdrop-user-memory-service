@@ -27,10 +27,27 @@ class UserProfileService {
   /**
    * Insert or update a profile entry identified by key.
    * key is normalised to lowercase so reads are case-insensitive.
+   *
+   * Sensitive-storage contract: when `sensitive` is set — or the key denotes a
+   * credential (credential:*, *password*, *token*, *secret*, *api_key*) — the
+   * value is encrypted via the crypto bridge (SAFE:) or macOS keychain
+   * (KEYTAR:) before storage. Plaintext is never written for sensitive rows;
+   * already-encrypted SAFE:/KEYTAR: refs pass through untouched.
    */
   async set(key, valueRef, opts = {}) {
-    const { sensitive = 0, service = null, label = null } = opts;
+    const { service = null, label = null } = opts;
+    let { sensitive = 0 } = opts;
     if (!key || !valueRef) throw new Error('key and valueRef are required');
+
+    const keyLower = String(key).toLowerCase();
+    const isCredentialKey = /credential:|password|secret|token|api[_-]?key/.test(keyLower);
+    const isRef = typeof valueRef === 'string' &&
+      (valueRef.startsWith('SAFE:') || valueRef.startsWith('KEYTAR:'));
+
+    if ((sensitive || isCredentialKey) && !isRef) {
+      valueRef = await this._encryptForStorage(keyLower, valueRef);
+      sensitive = 1;
+    }
 
     const safeKey   = key.replace(/'/g, SQ + SQ).toLowerCase().trim();
     const safeValue = String(valueRef).replace(/'/g, SQ + SQ);
@@ -204,6 +221,55 @@ class UserProfileService {
   }
 
   /**
+   * Encrypt a plaintext value for storage — crypto bridge (SAFE:) preferred,
+   * macOS keychain (KEYTAR:) as fallback. Returns the ref string to store.
+   * @private
+   */
+  async _encryptForStorage(key, plaintext) {
+    if (isBridgeAvailable()) {
+      try {
+        const ciphertext = await encryptValue(String(plaintext));
+        return `SAFE:${ciphertext}`;
+      } catch (e) {
+        logger.warn(`[UserProfileService] bridge encrypt failed for "${key}", falling back to keychain`, { error: e.message });
+      }
+    }
+    return this._storeInKeychain(key, String(plaintext));
+  }
+
+  /**
+   * One-time migration: re-encrypt sensitive rows that were written as
+   * plaintext before the sensitive-storage contract was enforced.
+   * Safe to run on every boot — skips rows already storing SAFE:/KEYTAR: refs.
+   */
+  async migratePlaintextSensitive() {
+    try {
+      const rows = await this.db.query(
+        `SELECT id, key, value_ref FROM user_profile
+         WHERE sensitive = 1
+           AND value_ref NOT LIKE 'SAFE:%'
+           AND value_ref NOT LIKE 'KEYTAR:%'`
+      );
+      if (rows.length === 0) return;
+
+      logger.info(`[UserProfileService] Migrating ${rows.length} plaintext sensitive rows to encrypted refs`);
+      for (const row of rows) {
+        try {
+          const ref = await this._encryptForStorage(row.key, row.value_ref);
+          const safeRef = ref.replace(/'/g, SQ + SQ);
+          await this.db.execute(
+            `UPDATE user_profile SET value_ref = '${safeRef}', updated_at = now() WHERE id = '${row.id}'`
+          );
+        } catch (e) {
+          logger.warn(`[UserProfileService] migration failed for key="${row.key}"`, { error: e.message });
+        }
+      }
+    } catch (e) {
+      logger.warn('[UserProfileService] plaintext sensitive migration failed', { error: e.message });
+    }
+  }
+
+  /**
    * Store a value in macOS keychain and return the KEYTAR: ref string.
    * Internal helper — used as the legacy fallback inside storeSecret().
    * @private
@@ -215,8 +281,12 @@ class UserProfileService {
       ['add-generic-password', '-s', 'thinkdrop', '-a', keytarKey, '-w', String(value), '-U'],
       { encoding: 'utf8' }
     );
-    if (proc.status !== 0 && proc.status !== null) {
-      logger.warn(`[UserProfileService] keychain write for "${keytarKey}" exited ${proc.status}: ${(proc.stderr || '').trim()}`);
+    if (proc.status !== 0) {
+      // Throw rather than return a dangling ref — a KEYTAR: pointer to a
+      // keychain entry that doesn't exist loses the value permanently.
+      // Callers (migration/set) leave the plaintext row intact so it can
+      // be retried on next boot instead of being corrupted.
+      throw new Error(`keychain write for "${keytarKey}" exited ${proc.status}: ${(proc.stderr || proc.error?.message || '').trim()}`);
     }
     return `KEYTAR:${keytarKey}`;
   }

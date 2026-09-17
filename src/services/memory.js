@@ -34,7 +34,7 @@ class MemoryService {
     try {
       // Validate input
       const text = validateMemoryText(data.text);
-      const userId = extractUserId(context) || data.userId || 'default_user';
+      const userId = data.userId || extractUserId(context) || 'default_user';
       const memoryId = generateMemoryId();
 
       // Parse metadata
@@ -75,13 +75,12 @@ class MemoryService {
       const embeddingValues = embedding.map(v => v.toString()).join(',');
       const sql = `
         INSERT INTO memory (
-          id, user_id, type, source_text, metadata, screenshot, 
+          id, user_id, type, source_text, metadata,
           extracted_text, embedding, created_at, updated_at
         ) VALUES (
           '${memoryId}', '${userId}', '${data.type || 'user_memory'}',
           '${text.replace(/'/g, '\'\'')}',
           '${metadataJson.replace(/'/g, '\'\'')}',
-          ${data.screenshot ? `'${data.screenshot}'` : 'NULL'},
           ${data.extractedText ? `'${data.extractedText.replace(/'/g, '\'\'')}'` : 'NULL'},
           list_value(${embeddingValues}),
           now(),
@@ -97,13 +96,14 @@ class MemoryService {
       for (const entity of entities) {
         try {
           const entityId = `ent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-          const normalizedValue = entity.normalized || entity.value;
+          const normalizedValue = String(entity.normalized ?? entity.value);
+          const entityValue = String(entity.value);
           const entitySql = `
             INSERT INTO memory_entities (id, memory_id, entity, type, entity_type, normalized_value)
             VALUES (
               '${entityId}',
               '${memoryId}',
-              '${entity.value.replace(/'/g, '\'\'')}',
+              '${entityValue.replace(/'/g, '\'\'')}',
               '${entity.type}',
               '${entity.entity_type || entity.type}',
               '${normalizedValue.replace(/'/g, '\'\'')}'
@@ -157,7 +157,7 @@ class MemoryService {
     const timings = {};
 
     try {
-      const userId = extractUserId(context) || options.userId || 'default_user';
+      const userId = options.userId || extractUserId(context) || 'default_user';
       const limit = options.limit || 25;
       const offset = options.offset || 0;
       const minSimilarity = options.minSimilarity || parseFloat(process.env.MIN_SIMILARITY_THRESHOLD) || 0.3;
@@ -219,28 +219,13 @@ class MemoryService {
         }
       }
 
-      // ── Episodic memory split ──────────────────────────────────────────────
-      // Screen captures live in episodic_memory, not memory. Default exclude
-      // them here so callers don't get stale rows before migration.
-      const excludeScreenCapture = !(
-        options.filters?.type === 'screen_capture' ||
-        (Array.isArray(options.filters?.type) && options.filters.type.includes('screen_capture'))
-      );
-      if (excludeScreenCapture) {
-        whereConditions.push('type != \'screen_capture\'');
-      }
-
       if (options.sessionId) {
         whereConditions.push(`metadata LIKE '%"sessionId":"${options.sessionId}"%'`);
       }
 
-      const whereClause = whereConditions.length > 0 
-        ? `WHERE ${whereConditions.join(' AND ')} AND embedding IS NOT NULL` 
+      const whereClause = whereConditions.length > 0
+        ? `WHERE ${whereConditions.join(' AND ')} AND embedding IS NOT NULL`
         : 'WHERE embedding IS NOT NULL';
-
-      // Legacy date-range screen capture dedup path — kept for backwards compat
-      // but screen_capture results should now come from episodic.search.
-      const isScreenCaptureDateRange = (startDate || endDate) && !excludeScreenCapture;
 
       const embeddingValues = queryEmbedding.map(v => v.toString()).join(',');
       const queryVector = `list_value(${embeddingValues})::FLOAT[384]`;
@@ -248,104 +233,72 @@ class MemoryService {
       let results;
       const dbStart = Date.now();
 
-      if (isScreenCaptureDateRange) {
-        console.log('🔍 [MEMORY-SEARCH] Using screen-capture date-range dedup');
-        const dedupSql = `
-          SELECT 
-            MIN(id) as id,
+      // Ensure VSS is loaded before issuing any array_cosine_distance() query.
+      // VSS is intentionally NOT loaded at startup (see database.js initVectorSearch).
+      // This call goes through _enqueue() so it is fully serialized — no screen
+      // monitor INSERT can be in flight at the same time.  After the first call
+      // this is a fast boolean check (no DB round-trip).
+      await this.db.ensureVssLoaded();
+
+      // Threshold-based search:
+      //   < HNSW_THRESHOLD rows → brute-force array_cosine_distance() (~25–55 ms)
+      //   >= HNSW_THRESHOLD rows → transient in-memory HNSW (cached 5 min, never on persistent DB)
+
+      // Count rows eligible for this search (whereClause already includes embedding IS NOT NULL)
+      const eligibleCountResult = await this.db.query(
+        `SELECT COUNT(*) as count FROM memory ${whereClause}`
+      );
+      const eligibleCount = Number(eligibleCountResult[0]?.count || 0);
+
+      console.log(`🔍 [MEMORY-SEARCH] Eligible rows: ${eligibleCount}, threshold: ${HNSW_THRESHOLD}`);
+
+      if (eligibleCount < HNSW_THRESHOLD) {
+        // ── Brute-force path ──────────────────────────────────────────────────
+        console.log('🔍 [MEMORY-SEARCH] Using brute-force search');
+        const sql = `
+          SELECT
+            id,
             type,
-            MIN(source_text) as source_text,
-            MIN(metadata) as metadata,
-            MIN(screenshot) as screenshot,
-            MIN(extracted_text) as extracted_text,
-            MIN(created_at) as created_at,
-            NULL as similarity,
-            NULL as final_score
+            source_text,
+            metadata,
+            extracted_text,
+            created_at,
+            (1 - array_cosine_distance(embedding, ${queryVector})) as similarity,
+            (
+              0.7 * (1 - array_cosine_distance(embedding, ${queryVector})) +
+              0.3 * CASE 
+                WHEN type = 'personal_profile' THEN 1.0
+                ELSE 1.0 / (1 + ln(1 + GREATEST(DATEDIFF('day', created_at, CURRENT_TIMESTAMP), 0)))
+              END
+            ) as final_score
           FROM memory
           ${whereClause}
-          GROUP BY 
-            type,
-            json_extract_string(metadata, '$.appName'),
-            json_extract_string(metadata, '$.windowTitle'),
-            date_trunc('hour', created_at)
-          ORDER BY MIN(created_at) DESC
+          ORDER BY final_score DESC
           LIMIT ${limit}
           OFFSET ${offset}
         `;
-        results = await this.db.query(dedupSql);
+        results = await this.db.query(sql);
       } else {
-        // Ensure VSS is loaded before issuing any array_cosine_distance() query.
-        // VSS is intentionally NOT loaded at startup (see database.js initVectorSearch).
-        // This call goes through _enqueue() so it is fully serialized — no screen
-        // monitor INSERT can be in flight at the same time.  After the first call
-        // this is a fast boolean check (no DB round-trip).
-        await this.db.ensureVssLoaded();
-
-        // Threshold-based search:
-        //   < HNSW_THRESHOLD rows → brute-force array_cosine_distance() (~25–55 ms)
-        //   >= HNSW_THRESHOLD rows → transient in-memory HNSW (cached 5 min, never on persistent DB)
-
-        // Count rows eligible for this search (whereClause already includes embedding IS NOT NULL)
-        const eligibleCountResult = await this.db.query(
-          `SELECT COUNT(*) as count FROM memory ${whereClause}`
+        // ── Transient in-memory HNSW path ─────────────────────────────────────
+        // Build (or reuse) a cached in-memory DuckDB instance with HNSW index.
+        // This is completely separate from the persistent DB so CHECKPOINT on
+        // the main DB never touches the HNSW graph.
+        console.log('🔍 [MEMORY-SEARCH] Using transient in-memory HNSW');
+        results = await this._searchWithTransientHnsw(
+          queryVector, whereClause, limit, offset
         );
-        const eligibleCount = Number(eligibleCountResult[0]?.count || 0);
-
-        console.log(`🔍 [MEMORY-SEARCH] Eligible rows: ${eligibleCount}, threshold: ${HNSW_THRESHOLD}`);
-
-        if (eligibleCount < HNSW_THRESHOLD) {
-          // ── Brute-force path ──────────────────────────────────────────────────
-          console.log('🔍 [MEMORY-SEARCH] Using brute-force search');
-          const sql = `
-            SELECT 
-              id,
-              type,
-              source_text,
-              metadata,
-              screenshot,
-              extracted_text,
-              created_at,
-              (1 - array_cosine_distance(embedding, ${queryVector})) as similarity,
-              (
-                0.7 * (1 - array_cosine_distance(embedding, ${queryVector})) +
-                0.3 * CASE 
-                  WHEN type = 'personal_profile' THEN 1.0
-                  ELSE 1.0 / (1 + ln(1 + GREATEST(DATEDIFF('day', created_at, CURRENT_TIMESTAMP), 0)))
-                END
-              ) as final_score
-            FROM memory
-            ${whereClause}
-            ORDER BY final_score DESC
-            LIMIT ${limit}
-            OFFSET ${offset}
-          `;
-          results = await this.db.query(sql);
-        } else {
-          // ── Transient in-memory HNSW path ─────────────────────────────────────
-          // Build (or reuse) a cached in-memory DuckDB instance with HNSW index.
-          // This is completely separate from the persistent DB so CHECKPOINT on
-          // the main DB never touches the HNSW graph.
-          console.log('🔍 [MEMORY-SEARCH] Using transient in-memory HNSW');
-          results = await this._searchWithTransientHnsw(
-            queryVector, whereClause, limit, offset
-          );
-        }
       }
 
       timings.dbQuery = Date.now() - dbStart;
 
       // ── BM25 + entity fusion ─────────────────────────────────────────────────
-      // For non-dedup searches, boost vector results that also match keywords or
-      // named entities, and pull in high-scoring keyword matches that vector search
-      // might have missed (e.g. rare names, exact file paths).
-      if (!isScreenCaptureDateRange) {
-        results = await this._fuseWithBm25AndEntities(results, query, userId, whereClause, limit, minSimilarity);
-      }
+      // Boost vector results that also match keywords or named entities, and
+      // pull in high-scoring keyword matches vector search might have missed
+      // (e.g. rare names, exact file paths).
+      results = await this._fuseWithBm25AndEntities(results, query, userId, whereClause, limit, minSimilarity);
 
       // Filter by minimum similarity and fetch entities for each result
-      const filteredResults = isScreenCaptureDateRange
-        ? results
-        : results.filter(r => r.similarity >= minSimilarity);
+      const filteredResults = results.filter(r => r.similarity >= minSimilarity);
       
       const duration = Date.now() - startTime;
       
@@ -415,7 +368,6 @@ class MemoryService {
               entity_type: e.entity_type
             })),
             metadata: parseMetadata(result.metadata),
-            screenshot: result.screenshot,
             extractedText: result.extracted_text,
             created_at: result.created_at
           };
@@ -466,7 +418,7 @@ class MemoryService {
     let bm25Results = [];
     try {
       const bm25Sql = `
-        SELECT m.id, m.type, m.source_text, m.metadata, m.screenshot, m.extracted_text, m.created_at,
+        SELECT m.id, m.type, m.source_text, m.metadata, m.extracted_text, m.created_at,
                score_bm25.score as bm25_score
         FROM memory m
         INNER JOIN (
@@ -549,7 +501,7 @@ class MemoryService {
     const timings = {};
 
     try {
-      const userId = extractUserId(context) || options.userId || 'default_user';
+      const userId = options.userId || extractUserId(context) || 'default_user';
       const limit = options.limit || 25;
       const offset = options.offset || 0;
       const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : (parseInt(process.env.MAX_AGE_DAYS) || 365);
@@ -629,7 +581,6 @@ class MemoryService {
             episodic_memory.type,
             MIN(episodic_memory.source_text) as source_text,
             MIN(episodic_memory.metadata) as metadata,
-            MIN(episodic_memory.screenshot) as screenshot,
             MIN(episodic_memory.extracted_text) as extracted_text,
             MIN(episodic_memory.created_at) as created_at,
             NULL as similarity,
@@ -658,7 +609,6 @@ class MemoryService {
             episodic_memory.type,
             episodic_memory.source_text,
             episodic_memory.metadata,
-            episodic_memory.screenshot,
             episodic_memory.extracted_text,
             episodic_memory.created_at,
             NULL as similarity,
@@ -698,7 +648,6 @@ class MemoryService {
               entity_type: e.entity_type
             })),
             metadata: parseMetadata(result.metadata),
-            screenshot: result.screenshot,
             extractedText: result.extracted_text,
             created_at: result.created_at
           };
@@ -818,7 +767,7 @@ class MemoryService {
     const candidateIds = hnswResults.map((r) => r.id);
     const idList = candidateIds.map((id) => `'${id.replace(/'/g, '\'\'')}'`).join(',');
     const fullRows = await this.db.query(`
-      SELECT id, type, source_text, metadata, screenshot, extracted_text, created_at
+      SELECT id, type, source_text, metadata, extracted_text, created_at
       FROM memory
       WHERE id IN (${idList})
     `);
@@ -875,7 +824,6 @@ class MemoryService {
           entity_type: e.entity_type
         })),
         metadata: parseMetadata(memory.metadata),
-        screenshot: memory.screenshot,
         extractedText: memory.extracted_text,
         created_at: memory.created_at,
         updated_at: memory.updated_at
@@ -939,7 +887,7 @@ class MemoryService {
       // Insert updated record
       const insertSQL = `
         INSERT INTO memory (
-          id, user_id, source_text, embedding, metadata, screenshot, 
+          id, user_id, source_text, embedding, metadata,
           extracted_text, type, created_at, updated_at
         ) VALUES (
           '${memoryId}',
@@ -947,7 +895,6 @@ class MemoryService {
           '${updates.text ? validateMemoryText(updates.text).replace(/'/g, '\'\'') : currentMemory.source_text.replace(/'/g, '\'\'')}',
           ${embeddingValue},
           '${updates.metadata ? JSON.stringify(updates.metadata).replace(/'/g, '\'\'') : (currentMemory.metadata || '{}').replace(/'/g, '\'\'')}',
-          ${updates.screenshot !== undefined ? (updates.screenshot ? `'${updates.screenshot}'` : 'NULL') : (currentMemory.screenshot ? `'${currentMemory.screenshot}'` : 'NULL')},
           ${updates.extractedText !== undefined ? (updates.extractedText ? `'${updates.extractedText.replace(/'/g, '\'\'')}'` : 'NULL') : (currentMemory.extracted_text ? `'${currentMemory.extracted_text.replace(/'/g, '\'\'')}'` : 'NULL')},
           '${currentMemory.type || 'user_memory'}',
           '${new Date(currentMemory.created_at).toISOString().slice(0, 19).replace('T', ' ')}',
@@ -966,13 +913,14 @@ class MemoryService {
         const entities = normalizeEntities(updates.entities);
         for (const entity of entities) {
           const entityId = `ent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-          const normalizedValue = entity.normalized || entity.value;
+          const normalizedValue = String(entity.normalized ?? entity.value);
+          const entityValue = String(entity.value);
           const entitySql = `
             INSERT INTO memory_entities (id, memory_id, entity, type, entity_type, normalized_value)
             VALUES (
               '${entityId}',
               '${memoryId}',
-              '${entity.value.replace(/'/g, '\'\'')}',
+              '${entityValue.replace(/'/g, '\'\'')}',
               '${entity.type}',
               '${entity.entity_type || entity.type}',
               '${normalizedValue.replace(/'/g, '\'\'')}'
@@ -1186,6 +1134,44 @@ class MemoryService {
       };
     } catch (error) {
       logger.error('Failed to get recent OCR', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * List the most recent episodic rows (screen captures) — no query required.
+   * Used by the personality synthesis agent to consume raw screen activity
+   * before it ages out of the hot retention window.
+   */
+  async listRecentEpisodic(options = {}, context = {}) {
+    try {
+      const userId = options.userId || extractUserId(context);
+      const limit = options.limit || 100;
+      const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : 7;
+
+      const sql = `
+        SELECT id, type, source_text, extracted_text, metadata, created_at
+        FROM episodic_memory
+        WHERE user_id = '${userId}'
+          AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY
+          AND json_extract_string(metadata, '$.overlayTainted') IS NULL
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `;
+      const results = await this.db.query(sql);
+      return {
+        memories: results.map(r => ({
+          id: r.id,
+          type: r.type,
+          text: r.extracted_text || r.source_text,
+          source_text: r.source_text,
+          metadata: parseMetadata(r.metadata),
+          created_at: r.created_at
+        })),
+        total: results.length
+      };
+    } catch (error) {
+      logger.error('Failed to list recent episodic memories', { error: error.message });
       throw error;
     }
   }

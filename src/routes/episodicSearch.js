@@ -67,4 +67,20 @@ router.post('/episodic.keywords', async (req, res, next) => {
   }
 });
 
+router.post('/episodic.recent', async (req, res, next) => {
+  try {
+    const { payload, context, requestId } = req.body;
+    const result = await memoryService.listRecentEpisodic(payload || {}, context);
+
+    res.json(formatMCPResponse(
+      'episodic.recent',
+      requestId,
+      'ok',
+      result
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;

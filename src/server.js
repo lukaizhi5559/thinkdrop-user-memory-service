@@ -34,8 +34,6 @@ import appHistoryRoute from './routes/appHistory.js';
 import skillPromptRoute from './routes/skillPrompt.js';
 import skillRegistryRoute from './routes/skillRegistry.js';
 import contextRuleRoute from './routes/contextRule.js';
-import apiRuleRoute from './routes/apiRule.js';
-import intentOverrideRoute from './routes/intentOverride.js';
 import phrasePreferenceRoute from './routes/phrasePreference.js';
 import personalityRoute from './routes/personality.js';
 import fingerprintRoute from './routes/fingerprint.js';
@@ -285,8 +283,6 @@ app.use(appHistoryRoute);
 app.use(skillPromptRoute);
 app.use(skillRegistryRoute);
 app.use(contextRuleRoute);
-app.use(apiRuleRoute);
-app.use(intentOverrideRoute);
 app.use(phrasePreferenceRoute);
 app.use(personalityRoute);
 app.use(fingerprintRoute);
@@ -312,6 +308,15 @@ async function startServer() {
     const embeddings = getEmbeddingService();
     await embeddings.initialize();
     logger.info('Embedding service initialized');
+
+    // Re-encrypt any sensitive user_profile rows written as plaintext before
+    // the sensitive-storage contract was enforced (SAFE:/KEYTAR: refs).
+    try {
+      const { getUserProfileService } = await import('./services/userProfile.js');
+      await getUserProfileService().migratePlaintextSensitive();
+    } catch (e) {
+      logger.warn('Plaintext sensitive migration failed (non-fatal)', { error: e.message });
+    }
 
     // Start data retention service
     const retention = getRetentionService();
@@ -365,8 +370,8 @@ async function startServer() {
       const retentionStatus = getRetentionService().getStatus();
       if (retentionStatus.enabled) {
         console.log('\n🗂️  Data Retention: ACTIVE');
-        console.log(`   Max retention: ${retentionStatus.maxDays} days (${(retentionStatus.maxDays / 365).toFixed(1)} years)`);
-        console.log(`   Purge amount: ${retentionStatus.purgeDays} days when limit reached`);
+        console.log(`   Memory retention: ${retentionStatus.maxDays} days (${(retentionStatus.maxDays / 365).toFixed(1)} years)`);
+        console.log(`   Episodic hot window: ${retentionStatus.episodicHotDays} days → archived to ${retentionStatus.archiveDir}`);
         console.log(`   Check interval: every ${retentionStatus.checkIntervalHours}h`);
       } else {
         console.log('\n🗂️  Data Retention: DISABLED (set RETENTION_ENABLED=true to enable)');
@@ -432,7 +437,7 @@ process.on('uncaughtException', async (error) => {
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason, _promise) => {
   logger.error('Unhandled Promise Rejection', {
     reason: reason?.message || reason,
     stack: reason?.stack,
