@@ -219,7 +219,8 @@ class ThoughtService {
         const ents = safeJsonParse(best.entity_names, []);
         matched =
           bestSim >= MATCH_SIM ||
-          (bestSim >= MATCH_SIM_ENTITY && sharedEntityCount(ents, entityNames) >= 1);
+          (bestSim >= MATCH_SIM_ENTITY && sharedEntityCount(ents, entityNames) >= 1) ||
+          bestSim >= MATCH_SIM_STRONG;
       }
     }
 

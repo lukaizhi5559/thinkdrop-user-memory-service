@@ -145,8 +145,17 @@ class DatabaseService {
             this._run = promisify(this.connection.run.bind(this.connection));
             this._all = promisify(this.connection.all.bind(this.connection));
 
+            // Store all timestamps in UTC — TIMESTAMP columns are tz-naive and
+            // the Node driver reads them back as UTC, so now()/CURRENT_TIMESTAMP
+            // must emit UTC wall-clock or every stored time is off by the local
+            // offset (Brain showed "4h ago" for fresh thoughts under EDT).
+            await this._run(`SET TimeZone='UTC'`);
+
             // Create tables
             await this.createTables();
+
+            // One-time data migration (guarded — never double-shifts)
+            await this.migrateTimestampsToUtc();
 
             // Load VSS extension for HNSW vector indexing
             await this.initVectorSearch();
@@ -173,6 +182,33 @@ class DatabaseService {
         reject(error);
       }
     });
+  }
+
+  /**
+   * One-time migration: existing rows were written with local-time (EDT)
+   * wall-clock values before the session TimeZone was pinned to UTC. Shift the
+   * SQL-written timestamp columns by +4h so they represent true UTC instants.
+   * Guarded by a _meta flag so it can never double-shift.
+   * snoozed_until is excluded — it's written from JS via toISOString() (UTC).
+   */
+  async migrateTimestampsToUtc() {
+    try {
+      await this.run(`CREATE TABLE IF NOT EXISTS _meta (k VARCHAR PRIMARY KEY, v VARCHAR)`);
+      const done = await this.all(`SELECT v FROM _meta WHERE k = 'tz_migrated'`);
+      if (done && done.length > 0) return;
+      await this.run(`
+        UPDATE thoughts SET
+          created_at   = created_at   + INTERVAL '4 hours',
+          updated_at   = updated_at   + INTERVAL '4 hours',
+          triggered_at = triggered_at + INTERVAL '4 hours',
+          completed_at = completed_at + INTERVAL '4 hours'
+      `);
+      await this.run(`INSERT INTO _meta VALUES ('tz_migrated', 'edt_to_utc_2026-09')`);
+      logger.info('Migrated thoughts timestamps EDT→UTC (+4h)');
+    } catch (e) {
+      // Non-fatal — timestamps stay locally-shifted but nothing else breaks
+      logger.warn('Timestamp TZ migration skipped:', { error: e.message });
+    }
   }
 
   /**
