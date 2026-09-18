@@ -582,6 +582,49 @@ class DatabaseService {
         // Column already exists on re-start — expected, skip silently
       }
 
+      // thoughts: persistent scored thoughts for the Thought/Trigger engine
+      // (personality-service thought-engine.cjs). Each row is a candidate
+      // observation accumulated across inputs (prompt/screen/memory/queue/silence).
+      // reinforcements: JSON array of activation traces [{ts, w, input, srcIds}] —
+      // score is derived: SUM(w_i * (1 + ageDays_i)^-d). Sources is a JSON array
+      // of evidence ids (episodic/memory/task/conversation ids).
+      // NOTE: embedding is stored as JSON TEXT (not FLOAT[384]) deliberately —
+      // once VSS is lazily LOADed its catalog hooks fire on INSERTs into any
+      // FLOAT[] column table and corrupt state after ~38 consecutive inserts
+      // (see initVectorSearch). Matching is brute-force JS cosine at this scale.
+      logger.info('Creating thoughts table...');
+      await this.run(`
+        CREATE TABLE IF NOT EXISTS thoughts (
+          id TEXT PRIMARY KEY,
+          user_id TEXT,
+          input TEXT,
+          status TEXT DEFAULT 'thought',
+          score FLOAT DEFAULT 0.0,
+          summary TEXT,
+          sources TEXT,
+          entity_names TEXT,
+          action_names TEXT,
+          embedding TEXT,
+          reinforcements TEXT,
+          silence_episode INTEGER DEFAULT 0,
+          action_json TEXT,
+          outcome_text TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          triggered_at TIMESTAMP,
+          completed_at TIMESTAMP,
+          snoozed_until TIMESTAMP
+        )
+      `);
+      await this.run('CREATE INDEX IF NOT EXISTS idx_thoughts_status ON thoughts(status)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_thoughts_user_status ON thoughts(user_id, status)');
+      await this.run('CREATE INDEX IF NOT EXISTS idx_thoughts_updated ON thoughts(updated_at)');
+      // Idempotent migration for DBs created before this column existed
+      try {
+        await this.run('ALTER TABLE thoughts ADD COLUMN snoozed_until TIMESTAMP');
+      } catch (e) { /* Column exists */ }
+      logger.info('Thoughts table created');
+
       // Pending long-running tasks (Phase 3: async completion via playwright waitForContent)
       logger.info('Creating pending_tasks table...');
       await this.run(`

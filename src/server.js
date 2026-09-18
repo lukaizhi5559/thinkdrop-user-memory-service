@@ -41,6 +41,7 @@ import userProfileRoute from './routes/userProfile.js';
 import userConstraintsRoute from './routes/userConstraints.js';
 import pendingTasksRoute from './routes/pendingTasks.js';
 import embedRoute from './routes/embed.js';
+import thoughtsRoute from './routes/thoughts.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -237,6 +238,57 @@ app.get('/service.capabilities', (req, res) => {
           inputSchema: {
             maxAgeHours: 'number (optional, default: 24)'
           }
+        },
+        {
+          name: 'thought.upsert',
+          description: 'Insert or semantically reinforce a Thought/Trigger-engine thought candidate (cross-modal dedup: match → append trace, else insert)',
+          inputSchema: {
+            input: 'string (required: prompt|screen_capture|memory|queue|silence|judgment)',
+            summary: 'string (required)',
+            entityNames: 'array (optional)',
+            actionNames: 'array (optional)',
+            sourceIds: 'array (optional)',
+            userId: 'string (optional, default: local_user)',
+            traceWeight: 'number (required)',
+            silenceEpisode: 'number (optional)',
+            forceNew: 'boolean (optional)'
+          }
+        },
+        {
+          name: 'thought.list',
+          description: 'List thoughts — default open statuses, sorted by live-recomputed trace score',
+          inputSchema: {
+            userId: 'string (optional)',
+            statuses: 'array (optional)',
+            all: 'boolean (optional)',
+            limit: 'number (optional)',
+            includeExpired: 'boolean (optional)'
+          }
+        },
+        {
+          name: 'thought.update',
+          description: 'Partial update (status/action/outcomeText) and/or append a reinforcement trace',
+          inputSchema: {
+            id: 'string (required)',
+            updates: 'object (optional)',
+            trace: 'object (optional: { w, input?, srcIds? })'
+          }
+        },
+        {
+          name: 'thought.purge',
+          description: 'Expire stale low-score thoughts and delete expired rows older than 30 days',
+          inputSchema: {
+            userId: 'string (optional)',
+            ttlHours: 'number (optional, default: 72)',
+            floorScore: 'number (optional, default: 0.15)'
+          }
+        },
+        {
+          name: 'thought.get',
+          description: 'Fetch a single thought by id',
+          inputSchema: {
+            id: 'string (required)'
+          }
         }
       ],
       features: [
@@ -290,6 +342,7 @@ app.use(userProfileRoute);
 app.use(userConstraintsRoute);
 app.use(pendingTasksRoute);
 app.use(embedRoute);
+app.use(thoughtsRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
@@ -359,6 +412,11 @@ async function startServer() {
       console.log('   - POST /personality.upsertTrait');
       console.log('   - POST /personality.getOverlay');
       console.log('   - POST /memory.embed');
+      console.log('   - POST /thought.upsert');
+      console.log('   - POST /thought.list');
+      console.log('   - POST /thought.update');
+      console.log('   - POST /thought.purge');
+      console.log('   - POST /thought.get');
       if (process.env.MONITOR_SCREEN_OCR === 'true') {
         console.log('\n👁️  Screen Monitor: ACTIVE');
         console.log(`   Capture interval: ${process.env.SCREEN_CAPTURE_INTERVAL || 10000}ms`);

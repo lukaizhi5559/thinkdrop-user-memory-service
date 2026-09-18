@@ -16,7 +16,9 @@ import { EventEmitter } from 'events';
 // ── Event-driven heartbeat notification ──────────────────────────────────────
 // When monitor events fire, POST a notification to the personality-service
 // so it can trigger an event-driven Tier 2 awareness check.
-const PERSONALITY_SERVICE_PORT = parseInt(process.env.PERSONALITY_SERVICE_PORT || '3008', 10);
+// personality-service listens on 3012 (see scripts/start-services.sh); 3008 is
+// screen-intelligence — a stale default here silently dropped monitor events.
+const PERSONALITY_SERVICE_PORT = parseInt(process.env.PERSONALITY_SERVICE_PORT || '3012', 10);
 const HEARTBEAT_NOTIFY_ENABLED = process.env.HEARTBEAT_NOTIFY_ENABLED !== 'false';
 
 function notifyPersonalityService(eventType, info) {
@@ -101,6 +103,11 @@ class MonitorService extends EventEmitter {
     this.lastWindowTitle = null;
     this.lastUrl = null;
     this.lastFilePath = null;
+    // Dwell tracking for the Thought engine: continuous same-app residence ≥
+    // DWELL_MS emits one 'dwell' event to personality-service per session.
+    this.dwellMs = parseInt(process.env.THOUGHT_DWELL_MS || '180000', 10);
+    this._dwellStartTs = null;
+    this._dwellEmitted = false;
     this.captureCount = 0;
     this.skipCount = 0;
     this.errorCount = 0;
@@ -459,10 +466,29 @@ class MonitorService extends EventEmitter {
         // ── App-Flow: record app switch (or file-open within same app) ──
         this._recordAppSwitch(appName, windowTitle, bounds, url, filePath);
       }
+      // Dwell reset on app change (title/file changes within an app keep dwelling)
+      if (appName !== this.lastAppName) {
+        this._dwellStartTs = Date.now();
+        this._dwellEmitted = false;
+      }
       this.lastAppName = appName;
       this.lastWindowTitle = windowTitle;
       this.lastUrl = url;
       this.lastFilePath = filePath || null;
+
+      // Dwell event: one emit per continuous same-app session ≥ dwellMs —
+      // feeds the Thought engine's screen_capture input (it samples episodic
+      // captures from the dwell window to extract a candidate).
+      if (appName && !this._dwellEmitted && this._dwellStartTs &&
+          Date.now() - this._dwellStartTs >= this.dwellMs) {
+        this._dwellEmitted = true;
+        const dwellInfo = {
+          app: appName, windowTitle, filePath: this.lastFilePath, url,
+          dwellMs: Date.now() - this._dwellStartTs, startedAt: this._dwellStartTs,
+        };
+        this.emit('dwell', dwellInfo);
+        notifyPersonalityService('dwell', dwellInfo);
+      }
 
       let screenshotBuffer;
 
