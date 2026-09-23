@@ -417,6 +417,39 @@ class OCRService {
   }
 
   /**
+   * Run OCR returning positional data — words with bounding boxes.
+   * Used by the browser-URL probe to locate the address-bar text.
+   * Returns { text, confidence, words: [{text, bbox:{x0,y0,x1,y1}, confidence}], elapsed }
+   */
+  async extractWithBoxes(imageBuffer) {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+    try {
+      const startTime = Date.now();
+      const { data } = await this.worker.recognize(imageBuffer);
+      const elapsed = Date.now() - startTime;
+      // tesseract.js exposes flat words[] on modern versions; fall back to
+      // flattening lines[].words[] or blocks→paragraphs→lines→words.
+      let words = Array.isArray(data.words) ? data.words : null;
+      if (!words) {
+        const lines = Array.isArray(data.lines) ? data.lines
+          : (data.blocks || []).flatMap(b => (b.paragraphs || []).flatMap(p => p.lines || []));
+        words = lines.flatMap(l => l.words || []);
+      }
+      return {
+        text: data.text || '',
+        confidence: data.confidence || 0,
+        words: words.map(w => ({ text: w.text, bbox: w.bbox, confidence: w.confidence })),
+        elapsed,
+      };
+    } catch (error) {
+      logger.error('OCR box extraction failed', { error: error.message });
+      return { text: '', confidence: 0, words: [], elapsed: 0 };
+    }
+  }
+
+  /**
    * Check if OCR text is different from the last capture.
    * Uses SHA-256 hash comparison.
    * Returns { isDifferent: boolean, hash: string }

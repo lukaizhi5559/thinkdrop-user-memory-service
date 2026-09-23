@@ -1,9 +1,110 @@
 import express from 'express';
 import { formatMCPResponse } from '../utils/helpers.js';
 import { getMonitorService } from '../monitor/monitorService.js';
-import { getActiveWindow, _inferPathFromTitle } from '../monitor/activeWindow.js';
+import { getMemoryService } from '../services/memory.js';
+import logger from '../utils/logger.js';
+import { getActiveWindow, _inferPathFromTitle, probeBrowserUrl, probeBrowserUrlViaOcr, _extractUrlCandidatesFromRows, _normalizeUrl, _titleMatchesLive, resolveUrlCandidateViaHistory, corroborateUrlViaHistory, isBrowserApp } from '../monitor/activeWindow.js';
 
 const router = express.Router();
+
+/**
+ * Tier 2a — lift the URL out of a stored screen capture's LiteParser
+ * structuredRows. Free (no new screenshot/OCR): the monitor already captured
+ * the visible screen — the omnibox text sits in the top-region rows.
+ * @param {object|null} capture — episodic capture row (structuredRows, url, ageMs)
+ * @param {object} [bounds] — active-window bounds; narrows rows to its toolbar
+ * @returns {string|null}
+ */
+/**
+ * Ranked URL candidates from a stored capture: Tier-0 fill first (capture.url),
+ * then toolbar-strip tokens, then — when window bounds exist — a wider
+ * top-region pass for degenerate/moved-window bounds.
+ */
+function _urlCandidatesFromCapture(capture, bounds) {
+  if (!capture) return [];
+  const rows = capture.structuredRows || [];
+  const cands = [];
+  const seen = new Set();
+  const push = (c) => { if (!seen.has(c.token)) { seen.add(c.token); cands.push(c); } };
+  if (capture.url) push({ token: capture.url, score: Infinity, y: bounds?.y ?? 0 }); // Tier-0 fill first
+  for (const c of _extractUrlCandidatesFromRows(rows, { bounds: bounds || null })) push(c);
+  if (bounds) {
+    // Bounds-filtered pass may miss (degenerate/moved-window bounds) — merge
+    // the wider top-region candidates after the toolbar-zone ones.
+    for (const c of _extractUrlCandidatesFromRows(rows, { maxY: 400 })) push(c);
+  }
+  return cands;
+}
+
+/**
+ * Strict last-resort: only a well-formed URL-shaped token positioned in the
+ * toolbar zone may become a URL without history evidence (incognito pages).
+ * Page-body tokens (y past the toolbar) can never reach here.
+ */
+function _strictFallbackCandidate(cands, bounds) {
+  const yMax = bounds && Number.isFinite(bounds.y) ? bounds.y + 95 : 200;
+  for (const c of cands) {
+    const n = _normalizeUrl(c.token);
+    if (n && (c.y ?? 0) <= yMax) return n;
+  }
+  return null;
+}
+
+/**
+ * Resolve capture candidates against History — a token becomes the page URL
+ * only when the browser's own record contains it (prefix → substring → host).
+ * No evidence → strict shape+position fallback → null.
+ */
+async function _resolveUrlCandidates(cands, appName, bounds, tag) {
+  for (const c of (cands || []).slice(0, 4)) {
+    const hit = await resolveUrlCandidateViaHistory(c.token, appName);
+    if (hit) {
+      logger.info(`[appHistory] url-probe ${tag} ${appName}: hit ${hit} (token '${c.token}')`);
+      return hit;
+    }
+  }
+  const fb = _strictFallbackCandidate(cands, bounds);
+  logger.info(`[appHistory] url-probe ${tag} ${appName}: ${fb ? `fallback ${fb}` : `miss (${(cands || []).length} candidates)`}`);
+  return fb;
+}
+
+/**
+ * Request-time URL fill for browsers. Ladder: T1 AppleScript (exact; fails on
+ * fullscreen windows) → T2a stored LiteParser rows → T2b fresh strip OCR →
+ * T3 History corroboration (prefix-expand + title match). Runs here (not just
+ * the poll loop) so the history-fallback path — overlay frontmost → previous-app
+ * entry — still resolves the URL of the browser window the user is reading.
+ * Fail-open: leaves url null.
+ */
+async function _ensureBrowserUrl(app) {
+  if (!app || app.url || !app.appName || !isBrowserApp(app.appName)) return;
+  try {
+    // One capture fetch shared by T2a (omnibox rows) and T3b (title candidates).
+    // 300s window: captures are diff-gated and stored sparsely — the latest
+    // capture for an app IS the page the user is on, even if minutes old.
+    const capture = await getMemoryService().getRecentOcr({
+      appName: app.appName,
+      maxAgeSeconds: 300,
+      includeTainted: true,
+    }).catch(() => null);
+
+    const liveTitle = app.windowTitle && app.windowTitle !== 'unknown' ? app.windowTitle : null;
+    const captureIsStale = Boolean(liveTitle && capture?.windowTitle && capture.windowTitle !== 'unknown'
+      && !_titleMatchesLive(capture.windowTitle, liveTitle));
+    const usableCapture = captureIsStale ? null : capture;
+    if (captureIsStale) {
+      logger.info(`[appHistory] url-probe ignored stale capture for ${app.appName}: capture='${capture.windowTitle}' live='${liveTitle}'`);
+    }
+    const captureTag = usableCapture ? 'stored-rows' : 'stored-rows-none';
+    if (!usableCapture) logger.info(`[appHistory] url-probe stored-rows ${app.appName}: no usable capture <300s`);
+    let url = await probeBrowserUrl(app.appName);                                  // T1
+    if (!url) url = await _resolveUrlCandidates(
+      _urlCandidatesFromCapture(usableCapture, app.bounds), app.appName, app.bounds, captureTag); // T2a
+    if (!url) url = await probeBrowserUrlViaOcr(app.appName, app.bounds || null);  // T2b (history-resolved inside)
+    url = await corroborateUrlViaHistory(url, usableCapture, app.appName, liveTitle); // T3 merge
+    app.url = url;
+  } catch (_) { /* probes are fail-open */ }
+}
 
 /**
  * POST /memory.getAppHistory
@@ -103,9 +204,11 @@ router.post('/memory.getActiveAppContext', async (req, res, next) => {
         filePath,
         url: live.url || null,
         bounds: live.bounds || null,
+        windowId: live.windowId || null,
         timestamp: new Date().toISOString(),
         source: 'live',
       };
+      await _ensureBrowserUrl(app);
       return res.json(formatMCPResponse('memory.getActiveAppContext', requestId, 'ok', { app }));
     }
 
@@ -120,6 +223,7 @@ router.post('/memory.getActiveAppContext', async (req, res, next) => {
         } catch (_) { /* deep find failed — keep null */ }
       }
       const app = { ...prev, filePath, source: 'history' };
+      await _ensureBrowserUrl(app);
       return res.json(formatMCPResponse('memory.getActiveAppContext', requestId, 'ok', { app }));
     }
 

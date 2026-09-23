@@ -1,4 +1,4 @@
-import { getActiveWindow, isSystemIdle } from './activeWindow.js';
+import { getActiveWindow, isSystemIdle, isBrowserApp, _extractUrlFromRows, _normalizeUrl } from './activeWindow.js';
 import { getScreenCaptureService } from './screenCapture.js';
 import OCRService, { getOCRService } from './ocrService.js';
 import { getDatabaseService } from '../services/database.js';
@@ -753,6 +753,16 @@ class MonitorService extends EventEmitter {
       const textItems = await this._captureStructuredItems(screenshotBuffer);
       if (textItems.length > 0) {
         structuredRows = structureOcrOverlayItems(textItems);
+      }
+    }
+
+    // Browser URL fill (Tier 0): the LiteParser pass already OCR'd the toolbar —
+    // lift the omnibox URL out of the top-strip rows when live detection didn't
+    // supply one. Free; makes the URL available to every downstream consumer.
+    if (!url && structuredRows.length > 0 && isBrowserApp(appName)) {
+      url = _normalizeUrl(_extractUrlFromRows(structuredRows, { bounds: bounds || null }));
+      if (url) {
+        logger.info(`[monitorService] URL extracted from LiteParser rows for ${appName}: ${url}`);
       }
     }
 

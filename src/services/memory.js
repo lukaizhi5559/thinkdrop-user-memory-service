@@ -1091,6 +1091,10 @@ class MemoryService {
         ? `CASE WHEN json_extract_string(metadata, '$.appName') = '${preferAppName.replace(/'/g, '\'\'')}' THEN 0 ELSE 1 END,`
         : '';
 
+      // includeTainted: URL extraction callers want the freshest capture of the
+      // app even if the overlay was in frame — the omnibox text stays legible.
+      const taintClause = options.includeTainted ? '' : 'AND json_extract_string(metadata, \'$.overlayTainted\') IS NULL';
+
       const sql = `
         SELECT 
           id,
@@ -1102,7 +1106,7 @@ class MemoryService {
         WHERE type = 'screen_capture'
           AND user_id = '${userId}'
           AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeSeconds}' SECOND
-          AND json_extract_string(metadata, '$.overlayTainted') IS NULL
+          ${taintClause}
           ${appNameClause}
         ORDER BY ${preferClause} created_at DESC
         LIMIT 1
@@ -1129,6 +1133,7 @@ class MemoryService {
         files: metadata.files || [],
         codeSnippets: metadata.codeSnippets || [],
         ocrConfidence: metadata.ocrConfidence || null,
+        structuredRows: metadata.structuredRows || [],
         capturedAt: metadata.capturedAt || row.created_at,
         ageMs: Date.now() - new Date(row.created_at).getTime()
       };
