@@ -11,6 +11,7 @@ import os from 'os';
 import path from 'path';
 import http from 'http';
 import { execSync, spawn } from 'child_process';
+import crypto from 'crypto';
 import { EventEmitter } from 'events';
 
 // ── Event-driven heartbeat notification ──────────────────────────────────────
@@ -20,6 +21,28 @@ import { EventEmitter } from 'events';
 // screen-intelligence — a stale default here silently dropped monitor events.
 const PERSONALITY_SERVICE_PORT = parseInt(process.env.PERSONALITY_SERVICE_PORT || '3012', 10);
 const HEARTBEAT_NOTIFY_ENABLED = process.env.HEARTBEAT_NOTIFY_ENABLED !== 'false';
+const VOICE_SERVICE_PORT = parseInt(process.env.VOICE_SERVICE_PORT || '3006', 10);
+const VOICE_NOTIFY_ENABLED = process.env.VOICE_NOTIFY_ENABLED !== 'false';
+
+// Push fresh OCR straight to voice-service the moment tesseract finishes —
+// bypasses the LiteParser/DB-store latency and voice's 45s rt-context poll, so
+// a live call sees the new screen within seconds of an app/tab switch.
+function notifyVoiceService(payload) {
+  if (!VOICE_NOTIFY_ENABLED) return;
+  const body = JSON.stringify(payload);
+  const req = http.request({
+    hostname: '127.0.0.1',
+    port: VOICE_SERVICE_PORT,
+    path: '/voice.screen',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    timeout: 3000,
+  }, (res) => { res.resume(); });
+  req.on('error', () => { /* voice-service may not be running — silent */ });
+  req.on('timeout', () => { req.destroy(); });
+  req.write(body);
+  req.end();
+}
 
 function notifyPersonalityService(eventType, info) {
   if (!HEARTBEAT_NOTIFY_ENABLED) return;
@@ -97,6 +120,16 @@ class MonitorService extends EventEmitter {
     super();
     this.isRunning = false;
     this.intervalId = null;
+    // Reentrancy guard — ticks are async and can outlive either interval;
+    // a second request while running is queued and drains once at the end.
+    this._tickRunning = false;
+    this._pendingTick = false;
+    // Lightweight active-window watch: detects app/tab switches ~1s after they
+    // happen instead of waiting up to captureInterval for the next full tick.
+    this.appWatchId = null;
+    this.appWatchMs = parseInt(process.env.SCREEN_APPWATCH_MS || '1000', 10);
+    // Dedup for the voice-service OCR push (don't spam rt-context on bursts).
+    this._lastScreenNotifyKey = null;
     this.captureInterval = parseInt(process.env.SCREEN_CAPTURE_INTERVAL || '5000', 10);
     this.idleTimeout = parseInt(process.env.SCREEN_CAPTURE_IDLE_TIMEOUT || '300000', 10);
     this.lastAppName = null;
@@ -384,6 +417,14 @@ class MonitorService extends EventEmitter {
       });
     }, this.captureInterval);
 
+    // Lightweight active-window watch — app/tab switches get a tick ~1s after
+    // they happen instead of waiting up to captureInterval for the next poll.
+    if (this.appWatchMs > 0) {
+      this.appWatchId = setInterval(() => {
+        this._appWatch().catch(() => {});
+      }, this.appWatchMs);
+    }
+
     // Run one-time migration to flag any existing overlay-tainted captures.
     // Fire-and-forget — it should not block the monitor loop.
     this.runOverlayTaintMigration().catch(() => {});
@@ -400,6 +441,10 @@ class MonitorService extends EventEmitter {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
+    if (this.appWatchId) {
+      clearInterval(this.appWatchId);
+      this.appWatchId = null;
+    }
 
     await this.ocr.terminate();
 
@@ -408,6 +453,45 @@ class MonitorService extends EventEmitter {
       totalSkips: this.skipCount,
       totalErrors: this.errorCount
     });
+  }
+
+  /**
+   * Reentrancy-guarded tick entry point. Ticks are async (screenshot + OCR +
+   * store can outlive either interval); a request while one is running is
+   * queued and drains once at the end so switches aren't missed.
+   */
+  async tick() {
+    if (this._tickRunning) { this._pendingTick = true; return; }
+    this._tickRunning = true;
+    try {
+      do {
+        this._pendingTick = false;
+        await this._tickOnce();
+      } while (this._pendingTick && this.isRunning);
+    } finally {
+      this._tickRunning = false;
+    }
+  }
+
+  /**
+   * Lightweight watch — active-window metadata only (no screenshot, no OCR).
+   * Detects app/tab switches ~appWatchMs after they happen and queues a real
+   * tick, so a switch's OCR starts ~seconds earlier than the 5s poll allows.
+   */
+  async _appWatch() {
+    if (!this.isRunning) return;
+    let win;
+    try { win = await getActiveWindow(); } catch (_) { return; }
+    if (!win || !win.appName) return;
+    if (this._isSkipApp(win.appName, win.url)) return;
+    // tick() handles the mid-flight case itself — it marks _pendingTick and
+    // drains once at the end, re-reading the window so nothing is missed.
+    if (win.appName !== this.lastAppName || win.windowTitle !== this.lastWindowTitle) {
+      this.tick().catch(err => {
+        logger.error('Monitor tick error', { error: err.message });
+        this.errorCount++;
+      });
+    }
   }
 
   /**
@@ -420,7 +504,7 @@ class MonitorService extends EventEmitter {
    *   5. OCR → text hash dedup
    *   6. Store episodic capture
    */
-  async tick() {
+  async _tickOnce() {
     try {
       // Step 1: Cheap idle check (ioreg) — skip everything if user is idle
       if (await isSystemIdle(this.idleTimeout)) {
@@ -546,6 +630,21 @@ class MonitorService extends EventEmitter {
 
       if (!isDifferent && titleChanged) {
         logger.info(`[monitorService] App switched to "${appName}" — bypassing text-hash dedup to anchor new app in DB`);
+      }
+
+      // Push the fresh OCR to voice-service immediately — before the LiteParser
+      // + DB-store latency below — so a live realtime call sees the new screen
+      // within ~ms of tesseract finishing rather than at the next rt poll.
+      const notifyKey = `${appName}|${crypto.createHash('sha256').update(ocrResult.text).digest('hex').slice(0, 16)}`;
+      if (notifyKey !== this._lastScreenNotifyKey) {
+        this._lastScreenNotifyKey = notifyKey;
+        notifyVoiceService({
+          appName,
+          windowTitle,
+          url: url || null,
+          capturedAt: new Date().toISOString(),
+          text: ocrResult.text.replace(/\s+/g, ' ').trim().slice(0, 800),
+        });
       }
 
       // Step 6: Store episodic capture
