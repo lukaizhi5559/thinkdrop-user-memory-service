@@ -91,7 +91,6 @@ const KNOWN_APPS = {
 const OVERLAY_STRONG_PHRASES = [
   'Ask or Drag-Drop anything here',
   'Copilot Screen Assistant',
-  'ThinkDrop',
   'You just switched to the',
 ];
 
@@ -99,19 +98,16 @@ function isOverlayTainted(text) {
   const lower = (text || '').toLowerCase();
   if (!lower) return false;
 
-  // Strong, unambiguous overlay phrases
+  // Strong, unambiguous overlay phrases only. The old weak heuristics —
+  // "results"+"agents" co-occurrence and "electron"+tab — flagged nearly every
+  // capture (any page containing both words, plus every capture where the
+  // overlay's tab strip was in frame), which is why date-range retrieval kept
+  // returning nothing. The overlay's rect is now masked in the screenshot
+  // before OCR, so this signature is only a fallback for content that slipped
+  // through — it must not misfire on ordinary page text.
   for (const phrase of OVERLAY_STRONG_PHRASES) {
     if (lower.includes(phrase.toLowerCase())) return true;
   }
-
-  // The two overlay tabs appear together
-  const hasResults = lower.includes('results');
-  const hasAgents = lower.includes('agents');
-  if (hasResults && hasAgents) return true;
-
-  // Electron identifier appears alongside one of the overlay tabs
-  if (lower.includes('electron') && (hasResults || hasAgents)) return true;
-
   return false;
 }
 
@@ -136,6 +132,9 @@ class MonitorService extends EventEmitter {
     this.lastWindowTitle = null;
     this.lastUrl = null;
     this.lastFilePath = null;
+    // Overlay-rect cache for pre-OCR masking (2s TTL — the overlay control
+    // server is local, and the cache keeps a fetch out of every tick).
+    this._overlayRects = null;
     // Dwell tracking for the Thought engine: continuous same-app residence ≥
     // DWELL_MS emits one 'dwell' event to personality-service per session.
     this.dwellMs = parseInt(process.env.THOUGHT_DWELL_MS || '180000', 10);
@@ -385,7 +384,6 @@ class MonitorService extends EventEmitter {
           WHERE type = 'screen_capture'
             AND json_extract_string(metadata, '$.appName') NOT IN ('Electron', 'ThinkDrop', 'unknown')
             AND json_extract_string(metadata, '$.appName') IS NOT NULL
-            AND json_extract_string(metadata, '$.overlayTainted') IS NULL
           ORDER BY created_at DESC
           LIMIT 1
         `);
@@ -612,6 +610,11 @@ class MonitorService extends EventEmitter {
         }
       }
 
+      // Mask the ThinkDrop overlay's rect before OCR — its UI text otherwise
+      // lands in extracted_text and (via the old signature filter) taints the
+      // row out of retrieval.
+      screenshotBuffer = await this._maskOverlayRegions(screenshotBuffer);
+
       // Step 5: Run OCR
       const ocrResult = await this.ocr.extractText(screenshotBuffer);
       if (!ocrResult.text || ocrResult.text.length < 10) {
@@ -816,6 +819,63 @@ class MonitorService extends EventEmitter {
   }
 
   /**
+   * Fetch the ThinkDrop overlay windows' screen rects from Electron main's
+   * overlay control server (127.0.0.1:3010/overlay/bounds). Cached 2s —
+   * the panel moves far slower than the capture cadence. Fail-open: null.
+   */
+  async _getOverlayRects() {
+    const now = Date.now();
+    if (this._overlayRects && now - this._overlayRects.ts < 2000) return this._overlayRects.rects;
+    try {
+      const res = await fetch('http://127.0.0.1:3010/overlay/bounds', {
+        signal: AbortSignal.timeout(1500),
+      });
+      const data = await res.json().catch(() => null);
+      const rects = (data && data.ok && Array.isArray(data.rects)) ? data.rects : [];
+      this._overlayRects = { rects, ts: now };
+      return rects;
+    } catch (_) {
+      // Overlay app not running — nothing to mask. Cache the miss briefly so a
+      // dead server doesn't add a 1.5s stall to every capture tick.
+      this._overlayRects = { rects: null, ts: now };
+      return null;
+    }
+  }
+
+  /**
+   * Paint the overlay windows' rects opaque black before OCR. The overlay is
+   * always-on-top so its UI text ("Ask or Drag-Drop anything here", tab strip)
+   * sits inside every capture — the post-hoc text filter ended up flagging
+   * nearly all episodic rows as tainted. Masking keeps the capture clean;
+   * content under the panel wasn't visible anyway.
+   */
+  async _maskOverlayRegions(buffer) {
+    const rects = await this._getOverlayRects();
+    if (!rects || !rects.length || !buffer) return buffer;
+    try {
+      const png = PNG.sync.read(buffer);
+      let hit = false;
+      for (const r of rects) {
+        const x0 = Math.max(0, Math.floor(r.x));
+        const y0 = Math.max(0, Math.floor(r.y));
+        const x1 = Math.min(png.width, Math.ceil(r.x + r.w));
+        const y1 = Math.min(png.height, Math.ceil(r.y + r.h));
+        if (x1 <= x0 || y1 <= y0) continue;
+        hit = true;
+        for (let y = y0; y < y1; y++) {
+          const start = (y * png.width + x0) * 4;
+          const end = (y * png.width + x1) * 4;
+          png.data.fill(0, start, end);
+          for (let i = start + 3; i < end; i += 4) png.data[i] = 255; // opaque black
+        }
+      }
+      return hit ? PNG.sync.write(png) : buffer;
+    } catch (_) {
+      return buffer;
+    }
+  }
+
+  /**
    * Fire-and-forget background enrichment trigger.
    * Called on app switch to warm boundary + shortcut caches in app.agent.
    */
@@ -931,44 +991,85 @@ class MonitorService extends EventEmitter {
   }
 
   /**
-   * One-time startup migration: flag existing screen captures that contain the
-   * ThinkDrop overlay so they are excluded from getRecentOcr and context queries.
-   * Idempotent — only updates rows where overlayTainted is not already set.
+   * Startup reconciliation: align overlayTainted flags with the tightened
+   * signature. The old weak heuristics ("results"+"agents" co-occurrence,
+   * "electron"+tab) flagged ~every capture — the overlay was visible in all of
+   * them — so historic rows must be un-tainted to become retrievable. Rows
+   * with a STRONG overlay phrase in their text stay flagged.
+   *
+   * Runs entirely inside DuckDB — a previous version SELECTed every capture's
+   * text columns into JS (~400MB of strings), which blew the 512MB
+   * --max-old-space-size cap and FATAL-OOM'd the process on every boot.
+   * Gated by a persistent _meta flag so the full-table pass runs once per
+   * database, not once per process.
    */
   async runOverlayTaintMigration() {
     if (this._overlayTaintMigrationDone) return;
     this._overlayTaintMigrationDone = true;
 
     try {
-      // Find candidate rows that are not already flagged
-      const candidates = await this.db.query(`
-        SELECT id, metadata, extracted_text, source_text
-        FROM episodic_memory
+      await this.db.execute('CREATE TABLE IF NOT EXISTS _meta (k VARCHAR PRIMARY KEY, v VARCHAR)');
+      const done = await this.db.query('SELECT v FROM _meta WHERE k = \'overlay_taint_reconciled\'');
+      if (done && done.length > 0) {
+        logger.debug('[monitorService] Overlay taint reconciliation already applied — skipping');
+        return;
+      }
+
+      // textExpr mirrors the JS `row.extracted_text || row.source_text` chain:
+      // NULLIF turns '' into NULL so COALESCE falls through like JS `||` does.
+      const textExpr = 'COALESCE(NULLIF(extracted_text, \'\'), source_text, \'\')';
+      const phraseClause = OVERLAY_STRONG_PHRASES
+        .map(p => `contains(lower(${textExpr}), '${p.toLowerCase().replace(/'/g, '\'\'')}')`)
+        .join('\n            OR ');
+
+      const flaggedProbe = `
+        SELECT COUNT(*) AS n FROM episodic_memory
         WHERE type = 'screen_capture'
-          AND json_extract_string(metadata, '$.overlayTainted') IS NULL
-      `);
+          AND COALESCE(json_extract_string(metadata, '$.overlayTainted'), 'x') <> 'true'
+          AND (
+            ${phraseClause}
+          )`;
+      const unflagProbe = `
+        SELECT COUNT(*) AS n FROM episodic_memory
+        WHERE type = 'screen_capture'
+          AND json_extract_string(metadata, '$.overlayTainted') = 'true'
+          AND NOT (
+            ${phraseClause}
+          )`;
 
-      let updated = 0;
-      for (const row of candidates || []) {
-        const text = row.extracted_text || row.source_text || '';
-        if (isOverlayTainted(text)) {
-          const metadata = JSON.parse(row.metadata || '{}');
-          metadata.overlayTainted = true;
-          const safeMetadata = JSON.stringify(metadata).replace(/'/g, '\'\'');
-          await this.db.execute(`
-            UPDATE episodic_memory
-            SET metadata = '${safeMetadata}'
-            WHERE id = '${row.id.replace(/'/g, '\'\'')}'
-          `);
-          updated++;
-        }
+      const toFlag = Number((await this.db.query(flaggedProbe))[0]?.n || 0);
+      const toClear = Number((await this.db.query(unflagProbe))[0]?.n || 0);
+
+      if (toFlag > 0) {
+        await this.db.execute(`
+          UPDATE episodic_memory
+          SET metadata = json_merge_patch(COALESCE(metadata, '{}'), '{"overlayTainted":true}')
+          WHERE type = 'screen_capture'
+            AND COALESCE(json_extract_string(metadata, '$.overlayTainted'), 'x') <> 'true'
+            AND (
+              ${phraseClause}
+            )
+        `);
       }
 
-      if (updated > 0) {
-        logger.info('[monitorService] Overlay taint migration completed', { updatedRows: updated });
-      } else {
-        logger.info('[monitorService] Overlay taint migration: no rows to update');
+      // json_merge_patch with a null value DELETES the key (RFC 7396), which
+      // preserves the `json_extract_string(...) IS NULL` check in memory.js.
+      if (toClear > 0) {
+        await this.db.execute(`
+          UPDATE episodic_memory
+          SET metadata = json_merge_patch(metadata, '{"overlayTainted":null}')
+          WHERE type = 'screen_capture'
+            AND json_extract_string(metadata, '$.overlayTainted') = 'true'
+            AND NOT (
+              ${phraseClause}
+            )
+        `);
       }
+
+      await this.db.execute(
+        `INSERT INTO _meta VALUES ('overlay_taint_reconciled', '${new Date().toISOString()}')`
+      );
+      logger.info('[monitorService] Overlay taint reconciliation done', { cleared: toClear, flagged: toFlag });
     } catch (err) {
       logger.warn(`[monitorService] Overlay taint migration failed: ${err.message}`);
     }

@@ -1159,7 +1159,6 @@ class MemoryService {
         FROM episodic_memory
         WHERE user_id = '${userId}'
           AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${maxAgeDays}' DAY
-          AND json_extract_string(metadata, '$.overlayTainted') IS NULL
         ORDER BY created_at DESC
         LIMIT ${limit}
       `;
@@ -1192,7 +1191,6 @@ class MemoryService {
       let whereConditions = [
         `user_id = '${userId}'`,
         'type = \'screen_capture\'',
-        'json_extract_string(metadata, \'$.overlayTainted\') IS NULL',
         'json_extract_string(metadata, \'$.appName\') IS NOT NULL',
         'json_extract_string(metadata, \'$.appName\') NOT IN (\'Electron\', \'ThinkDrop\', \'unknown\')'
       ];
@@ -1231,7 +1229,6 @@ class MemoryService {
       let whereConditions = [
         `user_id = '${userId}'`,
         'type = \'screen_capture\'',
-        'json_extract_string(metadata, \'$.overlayTainted\') IS NULL',
         'json_extract_string(metadata, \'$.appName\') IS NOT NULL',
         'json_extract_string(metadata, \'$.appName\') NOT IN (\'Electron\', \'ThinkDrop\', \'unknown\')'
       ];
