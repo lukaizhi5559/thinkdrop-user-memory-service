@@ -180,6 +180,25 @@ router.post('/memory.getPreviousActiveApp', async (req, res, next) => {
  * Response:
  *   { app: { appName, category, windowTitle, filePath, url, bounds, timestamp, source } | null }
  */
+// Internal ThinkDrop service pages (voice worker, health endpoints, MCP
+// service UIs) are infrastructure tabs, not user content — when the monitor
+// resolves the "live page URL" to one (observed: 127.0.0.1:3006/voice/worker
+// reported as the active Chrome page), deixis binds "the page"/"this" to a
+// service worker and plans route to the wrong surface. Strip it to null.
+const _INTERNAL_SERVICE_PORTS = new Set(['3001','3002','3004','3005','3006','3007','3008','3009','3010','3012','3015']);
+function _stripInternalServiceUrl(app) {
+  const u = String(app?.url || '');
+  if (!u) return;
+  try {
+    const p = new URL(u);
+    const loopback = p.hostname === 'localhost' || p.hostname === '127.0.0.1' || p.hostname === '[::1]';
+    if (loopback && (_INTERNAL_SERVICE_PORTS.has(p.port) || /^\/(?:voice|service|health|comms)/.test(p.pathname))) {
+      logger?.info?.(`[appHistory] stripping internal service URL from active context: ${u.slice(0, 80)}`);
+      app.url = null;
+    }
+  } catch (_) { /* unparseable url — leave as-is */ }
+}
+
 router.post('/memory.getActiveAppContext', async (req, res, next) => {
   try {
     const { requestId } = req.body;
@@ -209,6 +228,7 @@ router.post('/memory.getActiveAppContext', async (req, res, next) => {
         source: 'live',
       };
       await _ensureBrowserUrl(app);
+      _stripInternalServiceUrl(app);
       return res.json(formatMCPResponse('memory.getActiveAppContext', requestId, 'ok', { app }));
     }
 
@@ -224,6 +244,7 @@ router.post('/memory.getActiveAppContext', async (req, res, next) => {
       }
       const app = { ...prev, filePath, source: 'history' };
       await _ensureBrowserUrl(app);
+      _stripInternalServiceUrl(app);
       return res.json(formatMCPResponse('memory.getActiveAppContext', requestId, 'ok', { app }));
     }
 
