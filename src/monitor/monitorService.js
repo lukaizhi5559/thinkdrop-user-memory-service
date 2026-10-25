@@ -67,6 +67,76 @@ function notifyPersonalityService(eventType, info) {
   req.end();
 }
 
+// ── Screen content guard (children feature) ─────────────────────────────────
+// On each deduped capture, the OCR text is evaluated by the local phi4
+// decision model for explicit sexual, violent, or gore content. A YES paints
+// a blocking AlertCurtain on the GhostLayer screen surface — visible, not
+// silently ignored. Debounced per-app so the same screen doesn't re-alert.
+const SCREEN_GUARD_ENABLED = process.env.SCREEN_GUARD !== '0';
+const PHI4_URL = process.env.PHI4_URL || `http://127.0.0.1:${process.env.PHI4_SERVICE_PORT || '3009'}`;
+const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
+const SCREEN_GUARD_COOLDOWN_MS = parseInt(process.env.SCREEN_GUARD_COOLDOWN_MS || '90000', 10);
+const _screenGuardLast = new Map(); // appName → last check timestamp
+
+function _postJsonLocal(port, urlPath, payload, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    try {
+      const body = JSON.stringify(payload);
+      const req = http.request({
+        hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: timeoutMs,
+      }, (res) => {
+        let raw = '';
+        res.on('data', c => { raw += c; });
+        res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (_) { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.write(body);
+      req.end();
+    } catch (_) { resolve(null); }
+  });
+}
+
+async function _screenGuardCheck(appName, ocrText) {
+  if (!SCREEN_GUARD_ENABLED) return;
+  const text = String(ocrText || '').replace(/\s+/g, ' ').trim();
+  if (text.length < 40) return;
+  const now = Date.now();
+  const last = _screenGuardLast.get(appName) || 0;
+  if (now - last < SCREEN_GUARD_COOLDOWN_MS) return;
+  _screenGuardLast.set(appName, now);
+  try {
+    const res = await _postJsonLocal(new URL(PHI4_URL).port || 3009, '/decision.answer', {
+      version: 'mcp.v1',
+      service: 'phi4',
+      action: 'decision.answer',
+      requestId: 'sg_' + Date.now(),
+      payload: {
+        state: `App: ${appName}\nScreen text:\n${text.slice(0, 2500)}`,
+        questions: [{
+          id: 'unsafe', type: 'choice',
+          question: 'Does this screen content contain explicit sexual material, graphic violence, or gore — content inappropriate for a child under a Biblical/family-safety standard? Answer NO for ordinary violence references in news or scripture, medical/anatomy text, or fiction excerpts.',
+          options: ['YES', 'NO'],
+        }],
+      },
+    }, 10000);
+    const verdict = res?.data?.answers?.unsafe?.label;
+    if (verdict !== 'YES') return;
+    logger.warn('[monitorService] Screen guard: unsafe content detected', { app: appName });
+    await _postJsonLocal(MAIN_PORT, '/screen/display', {
+      kind: 'alert',
+      severity: 'block',
+      blocking: true,
+      scrim: 'black',
+      title: 'Content warning',
+      body: 'This screen may contain inappropriate content (explicit, sexual, or violent material). Please be careful — press Esc when you have moved to something safe.',
+      mood: 'alert',
+    }, 5000);
+  } catch (_) { /* phi4 down → skip quietly */ }
+}
+
 const KNOWN_APPS = {
   'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
   'Microsoft Edge': 'browser', 'Brave Browser': 'browser',
@@ -649,6 +719,11 @@ class MonitorService extends EventEmitter {
           text: ocrResult.text.replace(/\s+/g, ' ').trim().slice(0, 800),
         });
       }
+
+      // Screen content guard — phi4 decision call on the deduped OCR text;
+      // fires a blocking GhostLayer alert for explicit/violent content.
+      // Fire-and-forget so it never stalls the capture pipeline.
+      _screenGuardCheck(appName, ocrResult.text).catch(() => {});
 
       // Step 6: Store episodic capture
       await this.storeCapture(appName, windowTitle, ocrResult, url, screenshotBuffer, bounds, filePath);
