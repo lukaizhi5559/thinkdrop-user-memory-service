@@ -75,6 +75,12 @@ function notifyPersonalityService(eventType, info) {
 const SCREEN_GUARD_ENABLED = process.env.SCREEN_GUARD !== '0';
 const PHI4_URL = process.env.PHI4_URL || `http://127.0.0.1:${process.env.PHI4_SERVICE_PORT || '3009'}`;
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
+const COMMS_PORT = parseInt(process.env.THINKDROP_COMMS_PORT || '3015', 10);
+
+// Guardian/trigger rules — canonical matcher shared with stategraph +
+// comms-graph (one rules file, four evaluation seams; this is observation).
+let _rulesMod = null;
+try { _rulesMod = require('../../../command-service/src/skill-helpers/rules.cjs'); } catch (_) {}
 const SCREEN_GUARD_COOLDOWN_MS = parseInt(process.env.SCREEN_GUARD_COOLDOWN_MS || '90000', 10);
 const _screenGuardLast = new Map(); // appName → last check timestamp
 
@@ -275,8 +281,11 @@ class MonitorService extends EventEmitter {
     const last = this.appHistory[this.appHistory.length - 1];
     // Dedupe consecutive same-app + same-file entries.
     // A new entry IS pushed when the same app opens a different file —
-    // file-open events within the same app must be captured.
-    if (last && last.appName === appName && (last.filePath || null) === (filePath || null)) return;
+    // file-open events within the same app must be captured. A URL change
+    // within the same app/tab also counts — in-page navigation is exactly
+    // what trigger rules (when.urlMatch/hostMatch) observe.
+    if (last && last.appName === appName && (last.filePath || null) === (filePath || null)
+        && (last.url || null) === (url || null)) return;
     const entry = {
       appName,
       category: KNOWN_APPS[appName] || 'other',
@@ -290,6 +299,93 @@ class MonitorService extends EventEmitter {
     // Cap at 500 entries per day
     if (this.appHistory.length > 500) this.appHistory.shift();
     this._persistAppHistory();
+    this._evalObservationRules(entry);
+  }
+
+  /**
+   * Trigger rules — observation seam. A `when.hostMatch`/`when.appName` rule
+   * fires on ANY observed app/tab switch — the user's own navigation included,
+   * not just agent-driven tasks. `block`/`show_card` paint a (blocking) alert
+   * through the overlay's /screen/display channel; `enqueue_task` dispatches
+   * through comms-graph's proactive lane so the triggered task runs its own
+   * pipeline. Matching is deterministic — never a model call.
+   * @param {object} entry
+   */
+  _evalObservationRules(entry) {
+    if (!_rulesMod || !entry) return;
+    try {
+      const ctx = {
+        url: entry.url || '',
+        host: '',
+        appName: entry.appName,
+        windowTitle: entry.windowTitle || '',
+        filePath: entry.filePath || '',
+        prompt: '',
+      };
+      this._evalAndDispatch(ctx, 'observation');
+    } catch (_) {}
+  }
+
+  /**
+   * OCR seam — fires when a rule asserts when.ocrMatch over capture text.
+   * Gated by hasOcrRules() so captures cost nothing when no OCR rule exists.
+   * ctx: {appName, windowTitle, url, filePath, ocrText}
+   */
+  _evalOcrRules(ctx) {
+    if (!_rulesMod || !ctx) return;
+    try {
+      if (!_rulesMod.hasOcrRules()) return;
+      this._evalAndDispatch({ ...ctx, prompt: '' }, 'observation');
+    } catch (_) {}
+  }
+
+  _evalAndDispatch(ctx, seam) {
+    const hits = _rulesMod.evaluate(ctx, seam);
+    const fired = [];
+    for (const rule of hits) {
+      this._dispatchRuleAction(rule, ctx);
+      fired.push(rule.id);
+      logger.info(`[monitorService] trigger ${rule.id} fired at ${seam} (${ctx.url || ctx.appName || ctx.filePath}) → ${(rule.then || {}).action || 'notify'}`);
+    }
+    if (fired.length) _rulesMod.markFired(fired);
+  }
+
+  /**
+   * Dispatch one matched rule's then-action. `interpolate` resolves
+   * {{host}}/{{url}}/{{appName}}/{{windowTitle}}/{{filePath}} slots in the
+   * authored prompt/body against what actually matched — deterministic.
+   */
+  _dispatchRuleAction(rule, ctx) {
+    const t = _rulesMod.interpolate(rule.then || {}, ctx);
+    const action = t.action || 'notify';
+    if (action === 'show_card' || action === 'block' || action === 'notify') {
+      _postJsonLocal(MAIN_PORT, '/screen/display', {
+        kind: t.kind || 'alert',
+        severity: action === 'block' ? 'block' : (t.severity || 'info'),
+        blocking: action === 'block',
+        scrim: action === 'block' ? 'black' : undefined,
+        ...(t.emoji ? { emoji: t.emoji } : {}),
+        ...(typeof t.durationMs === 'number' ? { durationMs: t.durationMs } : {}),
+        title: t.title || (t.kind === 'emoji' ? undefined : `Guardian rule ${rule.id}`),
+        body: t.body || t.reason || t.msg || undefined,
+        mood: t.mood || (action === 'block' ? 'alert' : 'neutral'),
+      }, 5000).catch(() => {});
+    } else if (action === 'enqueue_task' && t.prompt) {
+      _postJsonLocal(COMMS_PORT, '/comms.proactive', {
+        prompt: t.prompt, source: 'trigger', ruleId: rule.id,
+        ...(Array.isArray(t.deterministicPlan) && t.deterministicPlan.length
+          ? { deterministicPlan: t.deterministicPlan } : {}),
+        ...(t.agentId ? { agentId: t.agentId } : {}),
+      }, 5000).catch(() => {});
+    } else if (action === 'ask') {
+      // No interactive path on this seam — surface as a blocking card.
+      _postJsonLocal(MAIN_PORT, '/screen/display', {
+        kind: 'alert', severity: 'block', blocking: true, scrim: 'black',
+        title: `Guardian rule ${rule.id}`,
+        body: t.body || t.reason || 'Restricted — a passphrase holder can manage rules via guardian commands.',
+        mood: 'alert',
+      }, 5000).catch(() => {});
+    }
   }
 
   /**
@@ -602,10 +698,13 @@ class MonitorService extends EventEmitter {
         return;
       }
 
-      // Step 3: Check if window context changed (app, title, or open file path)
+      // Step 3: Check if window context changed (app, title, URL, or open file path)
       const titleChanged = appName !== this.lastAppName || windowTitle !== this.lastWindowTitle;
       const filePathChanged = (filePath || null) !== (this.lastFilePath || null);
-      if ((titleChanged || filePathChanged) && appName) {
+      // In-page navigation with an unchanged window title still needs the
+      // observation seam — hostMatch/urlMatch rules watch the URL itself.
+      const urlChanged = (url || null) !== (this.lastUrl || null);
+      if ((titleChanged || filePathChanged || urlChanged) && appName) {
         // Phase 2: Invalidate previous app's boundary cache before switching
         if (this.lastAppName) {
           this._invalidateBoundaryCache(this.lastAppName, this.lastWindowTitle);
@@ -998,6 +1097,20 @@ class MonitorService extends EventEmitter {
       if (url) {
         logger.info(`[monitorService] URL extracted from LiteParser rows for ${appName}: ${url}`);
       }
+    }
+
+    // OCR trigger seam — only when an enabled rule asserts when.ocrMatch.
+    // The rule's then dispatches exactly like the app-switch observation path.
+    if (_rulesMod && _rulesMod.hasOcrRules()) {
+      try {
+        this._evalOcrRules({
+          appName,
+          windowTitle,
+          url: url || '',
+          filePath: filePath || '',
+          ocrText: processed.filteredText || ocrResult.text || '',
+        });
+      } catch (_) {}
     }
 
     // Build metadata with extracted files, code snippets, and OCR stats
