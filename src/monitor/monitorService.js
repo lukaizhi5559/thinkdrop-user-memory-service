@@ -430,6 +430,17 @@ class MonitorService extends EventEmitter {
     return this.appHistory.filter(e => new Date(e.timestamp).getTime() >= cutoff);
   }
 
+  // Live frontmost context for the audio journal's recordable verdict —
+  // nulls when the monitor isn't running (journal falls back to extension
+  // probe state only).
+  currentContext() {
+    return {
+      appName: this.lastAppName || null,
+      windowTitle: this.lastWindowTitle || null,
+      url: this.lastUrl || null,
+    };
+  }
+
   getPreviousActiveApp() {
     // Find the last non-overlay app entry from history (skips voice companion too)
     for (let i = this.appHistory.length - 1; i >= 0; i--) {

@@ -39,6 +39,8 @@ import personalityRoute from './routes/personality.js';
 import fingerprintRoute from './routes/fingerprint.js';
 import userProfileRoute from './routes/userProfile.js';
 import userConstraintsRoute from './routes/userConstraints.js';
+import audioJournalRoute from './routes/audioJournal.js';
+import { getAudioJournal } from './monitor/audioJournal.js';
 import pendingTasksRoute from './routes/pendingTasks.js';
 import embedRoute from './routes/embed.js';
 import thoughtsRoute from './routes/thoughts.js';
@@ -343,6 +345,7 @@ app.use(userConstraintsRoute);
 app.use(pendingTasksRoute);
 app.use(embedRoute);
 app.use(thoughtsRoute);
+app.use(audioJournalRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);
@@ -381,6 +384,10 @@ async function startServer() {
       await monitor.start();
       logger.info('Screen OCR monitor started');
     }
+
+    // Ambient audio journal — runs without the OCR monitor; in that case the
+    // recordable verdict falls back to extension probe state only.
+    getAudioJournal().start();
 
     // Start server
     app.listen(PORT, HOST, () => {
@@ -507,6 +514,7 @@ process.on('unhandledRejection', (reason, _promise) => {
 // Graceful shutdown
 async function gracefulShutdown(signal) {
   logger.info(`${signal} received, shutting down gracefully...`);
+  await getAudioJournal().stop();
   if (process.env.MONITOR_SCREEN_OCR === 'true') {
     const monitor = getMonitorService();
     await monitor.stop();
