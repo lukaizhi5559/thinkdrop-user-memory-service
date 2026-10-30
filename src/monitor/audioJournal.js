@@ -69,6 +69,25 @@ class AudioJournal {
     await this._closeSession('shutdown');
   }
 
+  // GET /audio.status — live capture state for the journal.status planning
+  // tool and manual bring-up checks.
+  status() {
+    const s = this._session;
+    return {
+      mode: MODE,
+      capturing: this._capturing,
+      verdict: this._isRecordable(),
+      session: s ? {
+        app: s.app, title: s.title, url: s.url, type: s.type,
+        started: new Date(s.started).toISOString(), segs: s.segs.length,
+        lastActivity: new Date(s.lastActivity).toISOString(),
+      } : null,
+      lastSegment: s && s.segs.length ? s.segs[s.segs.length - 1].text : null,
+      webMedia: [...this._webMedia.values()].map(m => ({ url: m.url, title: m.title, state: m.state })),
+      dir: AUDIO_DIR,
+    };
+  }
+
   // POST /audio.context — {tabId?, url, title, mediaTitle?, state, app?}
   handleContext(payload = {}) {
     if (MODE === 'off') return;

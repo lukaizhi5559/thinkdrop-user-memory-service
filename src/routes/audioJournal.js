@@ -26,4 +26,13 @@ router.post('/audio.segment', (req, res) => {
   }
 });
 
+// Live capture state — journal.status planning tool + manual bring-up checks.
+router.get('/audio.status', (req, res) => {
+  try {
+    res.json(getAudioJournal().status());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
