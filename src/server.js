@@ -319,6 +319,10 @@ app.post('/ping', (req, res) => {
 
 // Apply auth and validation to all MCP routes
 app.use(authMiddleware);
+// Audio-journal ingest routes take plain JSON bodies ({tabId, url, state} /
+// {text, ts}) from ext.gateway + voice-service — Bearer-gated like everything
+// else, but NOT MCP-enveloped, so they mount before validateMCPRequest.
+app.use(audioJournalRoute);
 app.use(validateMCPRequest);
 
 // MCP action routes
@@ -345,7 +349,6 @@ app.use(userConstraintsRoute);
 app.use(pendingTasksRoute);
 app.use(embedRoute);
 app.use(thoughtsRoute);
-app.use(audioJournalRoute);
 
 // Error handler (must be last)
 app.use(errorHandler);

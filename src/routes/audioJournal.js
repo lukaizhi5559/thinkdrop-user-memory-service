@@ -26,6 +26,20 @@ router.post('/audio.segment', (req, res) => {
   }
 });
 
+// POST /audio.capture — ambient capture lifecycle from voice-service/worker:
+//   {state:'requested'|'starting'|'active'|'stopped'|'error', error?}
+// This is what turns "capture requested" into "capture confirmed" — without it
+// the journal's capturing flag was optimistic and silent failures were
+// invisible.
+router.post('/audio.capture', (req, res) => {
+  try {
+    getAudioJournal().handleCaptureState(req.body || {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Live capture state — journal.status planning tool + manual bring-up checks.
 router.get('/audio.status', (req, res) => {
   try {
