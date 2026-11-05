@@ -49,6 +49,10 @@ import thoughtsRoute from './routes/thoughts.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
+// Secondary: project-root .env supplies cross-service keys (MCP_PHI4_API_KEY
+// etc.) monitorService needs to call other MCP services — comms-graph does the
+// same. override:false keeps the service-local file authoritative.
+dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env'), override: false });
 
 const app = express();
 const PORT = process.env.PORT || 3001;

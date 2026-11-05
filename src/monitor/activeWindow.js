@@ -1,5 +1,5 @@
-import { activeWindow as getActiveWin, openWindows } from 'get-windows';
-import { exec, execSync } from 'child_process';
+import { exec, execFile, execSync } from 'child_process';
+import { createRequire } from 'module';
 import { promisify } from 'util';
 import os from 'os';
 import path from 'path';
@@ -8,6 +8,49 @@ import logger from '../utils/logger.js';
 import { getOCRService } from './ocrService.js';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+const _require = createRequire(import.meta.url);
+
+// ── get-windows via direct binary spawn ─────────────────────────────────────
+// The npm wrapper calls execFile() with NO timeout — on a saturated or
+// TCC-stalled machine the `main` helper hangs forever and orphaned processes
+// pile up (observed: 15+ accumulated). Spawning it here with a hard timeout
+// guarantees children die; fail-soft semantics identical to the lib.
+let _getWindowsBin = null;
+function _resolveGetWindowsBin() {
+  if (_getWindowsBin) return _getWindowsBin;
+  // 'get-windows/package.json' isn't in the package's exports map — resolve
+  // the package entry instead; the `main` binary sits at the package root.
+  _getWindowsBin = path.join(path.dirname(_require.resolve('get-windows')), 'main');
+  return _getWindowsBin;
+}
+
+const GET_WINDOWS_TIMEOUT_MS = 1500;
+async function _execGetWindows(args = []) {
+  const { stdout } = await execFileAsync(_resolveGetWindowsBin(), args, {
+    timeout: GET_WINDOWS_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return JSON.parse(stdout);
+}
+
+const getActiveWin = () => _execGetWindows([]);
+async function _rawOpenWindows() { return _execGetWindows(['--open-windows-list']); }
+
+// openWindows enumerates every on-screen window — ~1 spawn per caller. Callers
+// within one capture tick all want the same snapshot; a short TTL dedups them.
+let _openWindowsCache = { result: null, ts: 0 };
+const OPEN_WINDOWS_CACHE_TTL = 3000;
+async function openWindows() {
+  const now = Date.now();
+  if (_openWindowsCache.result && now - _openWindowsCache.ts < OPEN_WINDOWS_CACHE_TTL) {
+    return _openWindowsCache.result;
+  }
+  const result = await _rawOpenWindows();
+  _openWindowsCache = { result, ts: Date.now() };
+  return result;
+}
 
 // Cache idle state — ioreg is expensive, only re-run every 4s
 let _idleCache = { idle: false, ts: 0 };

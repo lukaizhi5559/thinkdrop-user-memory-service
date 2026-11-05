@@ -41,3 +41,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# vision-ocr build output — lazily rebuilt by the monitor on first use
+native/bin/

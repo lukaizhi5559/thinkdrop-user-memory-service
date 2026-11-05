@@ -13,6 +13,8 @@ import http from 'http';
 import { execSync, spawn } from 'child_process';
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 
 // ── Event-driven heartbeat notification ──────────────────────────────────────
 // When monitor events fire, POST a notification to the personality-service
@@ -74,23 +76,57 @@ function notifyPersonalityService(eventType, info) {
 // silently ignored. Debounced per-app so the same screen doesn't re-alert.
 const SCREEN_GUARD_ENABLED = process.env.SCREEN_GUARD !== '0';
 const PHI4_URL = process.env.PHI4_URL || `http://127.0.0.1:${process.env.PHI4_SERVICE_PORT || '3009'}`;
+// phi4 enforces API_KEY auth — comms-graph sends Bearer via decision.cjs;
+// calls without it 401 silently (judge → 'NO', guards never fire). Read lazily:
+// this module is imported before server.js's dotenv.config runs, so a top-level
+// const would capture '' forever.
+const _phi4Key = () => process.env.MCP_PHI4_API_KEY || process.env.MCP_API_KEY || '';
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 const COMMS_PORT = parseInt(process.env.THINKDROP_COMMS_PORT || '3015', 10);
 
 // Guardian/trigger rules — canonical matcher shared with stategraph +
 // comms-graph (one rules file, four evaluation seams; this is observation).
+// ESM: bare `require` doesn't exist here — a silent ReferenceError left the
+// whole observation seam dead. Resolve via createRequire + ancestor walk-up
+// (same convention as executeCommand.js/preflightAgents.js), and LOG failure
+// so it can never go dark again.
+const _req = createRequire(import.meta.url);
 let _rulesMod = null;
-try { _rulesMod = require('../../../command-service/src/skill-helpers/rules.cjs'); } catch (_) {}
+try {
+  let _dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    const _candidate = path.join(_dir, 'mcp-services', 'command-service', 'src', 'skill-helpers', 'rules.cjs');
+    if (fs.existsSync(_candidate)) {
+      _rulesMod = _req(_candidate);
+      break;
+    }
+    _dir = path.dirname(_dir);
+  }
+  if (!_rulesMod) logger.warn('[monitorService] rules.cjs not found — observation-seam rules disabled');
+} catch (e) {
+  logger.warn(`[monitorService] rules.cjs failed to load — observation-seam rules disabled: ${e.message}`);
+}
+if (_rulesMod) {
+  try { logger.info(`[monitorService] rules.cjs loaded — observation-seam rules active (${_rulesMod.loadRules().length} enabled)`); } catch (_) {}
+}
 const SCREEN_GUARD_COOLDOWN_MS = parseInt(process.env.SCREEN_GUARD_COOLDOWN_MS || '90000', 10);
+// 'auto' = run the built-in guard only when no semantic observation rules are
+// enabled (they cover the same content classes with the image attached — this
+// guard sees text only). 'always' forces it on regardless.
+const SCREEN_GUARD = process.env.SCREEN_GUARD || 'auto';
 const _screenGuardLast = new Map(); // appName → last check timestamp
 
-function _postJsonLocal(port, urlPath, payload, timeoutMs = 8000) {
+function _postJsonLocal(port, urlPath, payload, timeoutMs = 8000, authToken = null) {
   return new Promise((resolve) => {
     try {
       const body = JSON.stringify(payload);
       const req = http.request({
         hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         timeout: timeoutMs,
       }, (res) => {
         let raw = '';
@@ -107,12 +143,14 @@ function _postJsonLocal(port, urlPath, payload, timeoutMs = 8000) {
 
 async function _screenGuardCheck(appName, ocrText) {
   if (!SCREEN_GUARD_ENABLED) return;
+  // Enabled semantic rules supplant this guard — same content classes, but
+  // judged with the image attached and via the reliable noul question form.
+  if (SCREEN_GUARD !== 'always' && _rulesMod?.hasSemanticRules?.()) return;
   const text = String(ocrText || '').replace(/\s+/g, ' ').trim();
   if (text.length < 40) return;
   const now = Date.now();
   const last = _screenGuardLast.get(appName) || 0;
   if (now - last < SCREEN_GUARD_COOLDOWN_MS) return;
-  _screenGuardLast.set(appName, now);
   try {
     const res = await _postJsonLocal(new URL(PHI4_URL).port || 3009, '/decision.answer', {
       version: 'mcp.v1',
@@ -122,13 +160,15 @@ async function _screenGuardCheck(appName, ocrText) {
       payload: {
         state: `App: ${appName}\nScreen text:\n${text.slice(0, 2500)}`,
         questions: [{
-          id: 'unsafe', type: 'choice',
-          question: 'Does this screen content contain explicit sexual material, graphic violence, or gore — content inappropriate for a child under a Biblical/family-safety standard? Answer NO for ordinary violence references in news or scripture, medical/anatomy text, or fiction excerpts.',
-          options: ['YES', 'NO'],
+          id: 'unsafe', type: 'noul',
+          question: 'Does this screen content contain explicit sexual material, graphic violence, or gore — content inappropriate for a child under a Biblical/family-safety standard? Answer no only for news reporting, medical/anatomy text, or religious scripture.',
         }],
       },
-    }, 10000);
-    const verdict = res?.data?.answers?.unsafe?.label;
+    }, 10000, _phi4Key());
+    // Stamp the debounce only on a real answer — a failed call (phi4 down/401)
+    // must not burn the 90s window and skip every subsequent capture.
+    if (res && res.status === 'ok') _screenGuardLast.set(appName, now);
+    const verdict = res?.data?.answers?.unsafe?.bool === true ? 'YES' : 'NO';
     if (verdict !== 'YES') return;
     logger.warn('[monitorService] Screen guard: unsafe content detected', { app: appName });
     await _postJsonLocal(MAIN_PORT, '/screen/display', {
@@ -141,6 +181,109 @@ async function _screenGuardCheck(appName, ocrText) {
       mood: 'alert',
     }, 5000);
   } catch (_) { /* phi4 down → skip quietly */ }
+}
+
+// ── Semantic rule judging (guardian semanticMatch/semanticExempt) ───────────
+// Rules asserting when.semanticMatch name a content-scene ("frame") a model
+// must confirm; when.semanticExempt names the anti-frame — same vocabulary,
+// wrong scene (news/medical/scripture/fiction). Judged on deduped captures:
+// the screenshot rides as `image` (decision.answer routes it to the vision
+// model d3:2b) with OCR text as state — the frame is evidence-agnostic and
+// catches imagery OCR can't read. One eval at a time via _semEvalRunning/
+// _semEvalPending (same coalescing pattern as _pendingTick): captures landing
+// mid-eval collapse to the newest ctx and run once. Verdicts cache by
+// frame+exempt+evidence hash; model down → 'NO' (fail-open, no fire).
+const SEM_RULE_CACHE_MS = parseInt(process.env.SEMANTIC_RULE_CACHE_MS || '300000', 10);
+const SEM_RULE_MIN_TEXT = 40;
+// Min interval between judge passes — each pass is 1-2 vision-model
+// generations (~2-8s CPU on small machines). Uncapped, continuous-change
+// screens (video, scrolling) would keep moondream saturated; capped, captures
+// collapse to the freshest ctx at most once per window.
+const SEM_JUDGE_MIN_MS = parseInt(process.env.SEMANTIC_JUDGE_MIN_MS || '8000', 10);
+const _semVerdicts = new Map(); // evidence sha → {v, ts}
+let _semEvalRunning = false;
+let _semEvalPending = null;
+let _semJudgeLastAt = 0;
+let _semJudgeWarnedAt = 0;
+
+async function _judgeSemantic(frame, exempt, ctx) {
+  const text = String(ctx.ocrText || '').replace(/\s+/g, ' ').trim();
+  const image = typeof ctx.image === 'string' && ctx.image ? ctx.image : null;
+  if (text.length < SEM_RULE_MIN_TEXT && !image) return 'NO';
+  const evKey = image
+    ? 'img:' + crypto.createHash('sha256').update(image).digest('hex')
+    : 'txt:' + text;
+  const key = crypto.createHash('sha256').update(`${frame}\n${exempt || ''}\n${evKey}`).digest('hex');
+  const hit = _semVerdicts.get(key);
+  if (hit && Date.now() - hit.ts < SEM_RULE_CACHE_MS) return hit.v;
+  const _judgeUnavailable = (res) => {
+    // Judge unreachable/denied — return NO but DO NOT cache: a cached 'NO'
+    // would keep the rule dark for 5min after phi4 recovers.
+    if (Date.now() - _semJudgeWarnedAt > 60000) {
+      _semJudgeWarnedAt = Date.now();
+      logger.warn('[monitorService] semantic judge unavailable — returning NO (uncached)', { status: res?.status || res?.error?.code || 'no-response' });
+    }
+    return 'NO';
+  };
+  const state = `App: ${ctx.appName}\nURL: ${ctx.url || ''}\nTitle: ${ctx.windowTitle || ''}\nScreen text:\n${text.slice(0, 2500)}`;
+  let verdict = 'NO';
+  try {
+    // One fused yes/no question — frame + exemption qualifier in a single
+    // model pass. Verified empirically on this machine's judge models:
+    // lettered YES/NO choices produce false-YESes (first-option attractor)
+    // and the enumerated exempt prompt returns empty from moondream; plain
+    // "Answer yes or no" (noul) answers correctly on both tev1 and moondream
+    // — and one inference instead of two halves judge cost.
+    const res = await _postJsonLocal(new URL(PHI4_URL).port || 3009, '/decision.answer', {
+      version: 'mcp.v1',
+      service: 'phi4',
+      action: 'decision.answer',
+      requestId: 'sr_' + Date.now(),
+      payload: {
+        state,
+        questions: [{
+          id: 'match', type: 'noul',
+          question: exempt == null
+            ? `Does this screen content present "${frame}" as the actual material itself — not a news article, medical page, or quote about it?`
+            : `Does this screen content present "${frame}" as the actual material itself — not ${exempt}?`,
+        }],
+        ...(image ? { image } : {}),
+      },
+    }, 15000, _phi4Key());
+    if (res?.status !== 'ok') return _judgeUnavailable(res);
+    verdict = res?.data?.answers?.match?.bool === true ? 'YES' : 'NO';
+  } catch (_) { /* phi4/vision down → no match */ }
+  if (_semVerdicts.size > 200) _semVerdicts.clear();
+  _semVerdicts.set(key, { v: verdict, ts: Date.now() });
+  return verdict;
+}
+
+// Downscale a PNG for the semantic judge — a full-retina shot is multi-MB
+// base64 and stalls the vision POST + moondream inference (encode cost scales
+// with pixels). moondream resizes input to ~378px internally, so ~384px loses
+// nothing the model would see and encodes ~4x cheaper than 720px.
+// Nearest-neighbor stride sampling, ~50ms.
+function _downscalePng(buffer, targetW = parseInt(process.env.SEM_JUDGE_IMAGE_W || '384', 10)) {
+  try {
+    const png = PNG.sync.read(buffer);
+    if (png.width <= targetW) return buffer;
+    const scale = png.width / targetW;
+    const W = targetW;
+    const H = Math.max(1, Math.round(png.height / scale));
+    const out = new PNG({ width: W, height: H });
+    for (let y = 0; y < H; y++) {
+      const sy = Math.min(png.height - 1, Math.floor(y * scale));
+      for (let x = 0; x < W; x++) {
+        const sx = Math.min(png.width - 1, Math.floor(x * scale));
+        const s = (sy * png.width + sx) * 4;
+        const d = (y * W + x) * 4;
+        for (let k = 0; k < 4; k++) out.data[d + k] = png.data[s + k];
+      }
+    }
+    return PNG.sync.write(out);
+  } catch (_) {
+    return buffer;
+  }
 }
 
 const KNOWN_APPS = {
@@ -203,6 +346,15 @@ class MonitorService extends EventEmitter {
     // Dedup for the voice-service OCR push (don't spam rt-context on bursts).
     this._lastScreenNotifyKey = null;
     this.captureInterval = parseInt(process.env.SCREEN_CAPTURE_INTERVAL || '5000', 10);
+    // Adaptive backoff ceiling — ticks that store no capture stretch the poll
+    // toward this cap (5s→10s→20s), cutting screencapture/replayd load ~4x on
+    // steady screens. Any stored capture resets to captureInterval.
+    this.maxCaptureInterval = parseInt(process.env.SCREEN_CAPTURE_MAX_INTERVAL || '20000', 10);
+    this._unchangedStreak = 0;
+    // LiteParser structured-rows scope: 'browser' (default — rows mainly feed
+    // browser URL/title resolution; ~8s CPU per capture otherwise), 'always',
+    // or 'off'.
+    this.structuredParseScope = process.env.MONITOR_STRUCTURED_PARSE || 'browser';
     this.idleTimeout = parseInt(process.env.SCREEN_CAPTURE_IDLE_TIMEOUT || '300000', 10);
     this.lastAppName = null;
     this.lastWindowTitle = null;
@@ -327,16 +479,59 @@ class MonitorService extends EventEmitter {
   }
 
   /**
-   * OCR seam — fires when a rule asserts when.ocrMatch over capture text.
-   * Gated by hasOcrRules() so captures cost nothing when no OCR rule exists.
-   * ctx: {appName, windowTitle, url, filePath, ocrText}
+   * OCR seam — deterministic hits dispatch immediately; semanticMatch rules
+   * trail behind a coalesced async judge pass (vision calls take ~1-3s).
+   * Gated by hasOcrRules() || hasSemanticRules() so captures cost nothing
+   * when no OCR/semantic rule exists.
+   * ctx: {appName, windowTitle, url, filePath, ocrText, image?}
    */
   _evalOcrRules(ctx) {
     if (!_rulesMod || !ctx) return;
     try {
-      if (!_rulesMod.hasOcrRules()) return;
-      this._evalAndDispatch({ ...ctx, prompt: '' }, 'observation');
+      const hasSem = _rulesMod.hasSemanticRules();
+      if (!_rulesMod.hasOcrRules() && !hasSem) return;
+      const full = { ...ctx, prompt: '' };
+      this._evalAndDispatch(full, 'observation');
+      if (!hasSem) return;
+      if (_semEvalRunning) { _semEvalPending = full; return; }
+      _semEvalRunning = true;
+      (async () => {
+        try {
+          let c = full;
+          do {
+            // Rate cap — wait out the remainder of the judge window, then
+            // prefer any ctx that landed during the wait (freshest wins).
+            const wait = SEM_JUDGE_MIN_MS - (Date.now() - _semJudgeLastAt);
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            c = _semEvalPending || c;
+            _semEvalPending = null;
+            _semJudgeLastAt = Date.now();
+            await this._evalAndDispatchSemantic(c);
+            c = _semEvalPending;
+          } while (c);
+        } finally {
+          _semEvalRunning = false;
+        }
+      })().catch(() => {});
     } catch (_) {}
+  }
+
+  /**
+   * Semantic pass — evaluateAsync runs the injected judge over rules whose
+   * deterministic fields already matched. Det hits are the sync path's job
+   * (semantic rules can never match sync whenMatches), so only rules
+   * asserting semanticMatch dispatch/mark here.
+   */
+  async _evalAndDispatchSemantic(ctx) {
+    const hits = await _rulesMod.evaluateAsync(ctx, 'observation', _judgeSemantic);
+    const fired = [];
+    for (const rule of hits) {
+      if (!rule.when?.semanticMatch) continue;
+      this._dispatchRuleAction(rule, ctx);
+      fired.push(rule.id);
+      logger.info(`[monitorService] semantic trigger ${rule.id} fired at observation (${ctx.url || ctx.appName}) → ${(rule.then || {}).action || 'notify'}`);
+    }
+    if (fired.length) _rulesMod.markFired(fired);
   }
 
   _evalAndDispatch(ctx, seam) {
@@ -533,8 +728,11 @@ class MonitorService extends EventEmitter {
       return;
     }
 
-    // Initialize OCR worker
-    await this.ocr.initialize();
+    // OCR: native Vision path needs no eager worker — tesseract (~300-400MB
+    // RSS) only spins up lazily if Vision actually fails at extract-time.
+    if (!(await this.ocr.isVisionAvailable())) {
+      await this.ocr.initialize();
+    }
 
     // Cold-start: restore lastNonOverlayApp so getRecentOcr works correctly from the
     // very first request after a service restart.
@@ -584,13 +782,24 @@ class MonitorService extends EventEmitter {
     // Run first capture immediately
     await this.tick();
 
-    // Then set up the interval
-    this.intervalId = setInterval(() => {
-      this.tick().catch(err => {
-        logger.error('Monitor tick error', { error: err.message });
-        this.errorCount++;
-      });
-    }, this.captureInterval);
+    // Adaptive poll — self-rescheduling so the cadence can breathe. A tick
+    // that stored no capture grows the delay (5s→10s→20s); any stored capture
+    // (here or an appWatch-triggered tick) resets _unchangedStreak → fast again.
+    const _schedulePoll = () => {
+      if (!this.isRunning) return;
+      const delay = this._unchangedStreak > 0
+        ? Math.min(this.captureInterval * (1 << this._unchangedStreak), this.maxCaptureInterval)
+        : this.captureInterval;
+      this.intervalId = setTimeout(() => {
+        this.tick()
+          .catch(err => {
+            logger.error('Monitor tick error', { error: err.message });
+            this.errorCount++;
+          })
+          .finally(_schedulePoll);
+      }, delay);
+    };
+    _schedulePoll();
 
     // Lightweight active-window watch — app/tab switches get a tick ~1s after
     // they happen instead of waiting up to captureInterval for the next poll.
@@ -641,7 +850,13 @@ class MonitorService extends EventEmitter {
     try {
       do {
         this._pendingTick = false;
+        const before = this.captureCount;
         await this._tickOnce();
+        // Capture stored → real change happened → snap back to fast cadence;
+        // no capture → the screen was steady → lengthen the next poll.
+        this._unchangedStreak = this.captureCount > before
+          ? 0
+          : Math.min(this._unchangedStreak + 1, 4);
       } while (this._pendingTick && this.isRunning);
     } finally {
       this._tickRunning = false;
@@ -835,6 +1050,23 @@ class MonitorService extends EventEmitter {
       // Fire-and-forget so it never stalls the capture pipeline.
       _screenGuardCheck(appName, ocrResult.text).catch(() => {});
 
+      // OCR/semantic rule seam — evaluate + dispatch BEFORE storeCapture so the
+      // ~8s LiteParser pass + DB insert don't gate rule firing (the old
+      // placement put the eval last in the pipeline — the 10-20s latency).
+      if (_rulesMod && (_rulesMod.hasOcrRules() || _rulesMod.hasSemanticRules())) {
+        try {
+          this._evalOcrRules({
+            appName,
+            windowTitle,
+            url: url || '',
+            filePath: filePath || '',
+            ocrText: ocrResult.text || '',
+            image: _rulesMod.hasSemanticRules() && screenshotBuffer
+              ? _downscalePng(screenshotBuffer).toString('base64') : '',
+          });
+        } catch (_) {}
+      }
+
       // Step 6: Store episodic capture
       await this.storeCapture(appName, windowTitle, ocrResult, url, screenshotBuffer, bounds, filePath);
       this.captureCount++;
@@ -931,7 +1163,7 @@ class MonitorService extends EventEmitter {
     if (autoScrollMs > 0 && mainRegion) {
       session.autoScrollInterval = setInterval(async () => {
         try {
-          const nut = require('@nut-tree-fork/nut-js');
+          const nut = _req('@nut-tree-fork/nut-js');
           await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
           await new Promise(r => setTimeout(r, 200));
           await nut.mouse.scrollDown(2);
@@ -1091,9 +1323,12 @@ class MonitorService extends EventEmitter {
       logger.info('[monitorService] Overlay detected in capture — flagging as tainted', { appName, windowTitle });
     }
 
-    // Capture structured items via LiteParser (best-effort, falls back to empty)
+    // Capture structured items via LiteParser (best-effort, falls back to
+    // empty). Scoped by structuredParseScope — 'browser' skips the ~8s CPU
+    // pass on non-browser captures where the rows are rarely consumed.
     let structuredRows = [];
-    if (screenshotBuffer) {
+    if (screenshotBuffer && (this.structuredParseScope === 'always' ||
+        (this.structuredParseScope === 'browser' && isBrowserApp(appName)))) {
       const textItems = await this._captureStructuredItems(screenshotBuffer);
       if (textItems.length > 0) {
         structuredRows = structureOcrOverlayItems(textItems);
@@ -1110,19 +1345,8 @@ class MonitorService extends EventEmitter {
       }
     }
 
-    // OCR trigger seam — only when an enabled rule asserts when.ocrMatch.
-    // The rule's then dispatches exactly like the app-switch observation path.
-    if (_rulesMod && _rulesMod.hasOcrRules()) {
-      try {
-        this._evalOcrRules({
-          appName,
-          windowTitle,
-          url: url || '',
-          filePath: filePath || '',
-          ocrText: processed.filteredText || ocrResult.text || '',
-        });
-      } catch (_) {}
-    }
+    // OCR/semantic trigger seam moved to _tickOnce (before this function) so
+    // the LiteParser pass + DB insert below don't gate rule dispatch.
 
     // Build metadata with extracted files, code snippets, and OCR stats
     const category = KNOWN_APPS[appName] || 'other';

@@ -1,6 +1,71 @@
 import Tesseract from 'tesseract.js';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { execFile } from 'child_process';
+import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+
+// ── macOS Vision OCR fast path ──────────────────────────────────────────────
+// tesseract takes ~6s on a retina screenshot; the bundled Vision CLI
+// (native/vision-ocr.swift → bin/vision-ocr) answers in ~1-2s cold. extractText
+// tries the helper first and falls back to the tesseract worker when the
+// binary can't build or run — non-macOS installs keep the old path.
+const _OCR_DIR = path.dirname(fileURLToPath(import.meta.url));
+const VISION_OCR_BIN = path.join(_OCR_DIR, '..', '..', 'native', 'bin', 'vision-ocr');
+const VISION_OCR_SRC = path.join(_OCR_DIR, '..', '..', 'native', 'vision-ocr.swift');
+const VISION_OCR_TIMEOUT_MS = 8000;
+let _visionState = null; // null=unknown | 'ok' | 'unavailable'
+let _visionBuilding = null;
+
+function _buildVisionOcr() {
+  if (_visionBuilding) return _visionBuilding;
+  _visionBuilding = new Promise((resolve) => {
+    execFile('swiftc', ['-O', '-o', VISION_OCR_BIN, VISION_OCR_SRC], { timeout: 120000 }, (err) => {
+      resolve(!err);
+    });
+  }).finally(() => { _visionBuilding = null; });
+  return _visionBuilding;
+}
+
+async function _visionAvailable() {
+  if (_visionState) return _visionState === 'ok';
+  try {
+    if (!fs.existsSync(VISION_OCR_BIN)) {
+      if (!fs.existsSync(VISION_OCR_SRC)) { _visionState = 'unavailable'; return false; }
+      fs.mkdirSync(path.dirname(VISION_OCR_BIN), { recursive: true });
+      const built = await _buildVisionOcr();
+      if (!built) { _visionState = 'unavailable'; return false; }
+      logger.info('[OCR] vision-ocr helper compiled — fast OCR path enabled');
+    }
+    _visionState = 'ok';
+    return true;
+  } catch (_) {
+    _visionState = 'unavailable';
+    return false;
+  }
+}
+
+async function _visionExtract(imageBuffer) {
+  if (!(await _visionAvailable())) return null;
+  const tmpPath = path.join(os.tmpdir(), `vocr-${process.pid}-${Date.now()}.png`);
+  try {
+    fs.writeFileSync(tmpPath, imageBuffer);
+    const { stdout } = await new Promise((resolve) => {
+      execFile(VISION_OCR_BIN, [tmpPath], { timeout: VISION_OCR_TIMEOUT_MS }, (err, stdout) => {
+        resolve(err ? null : { stdout });
+      });
+    });
+    if (!stdout) return null;
+    const parsed = JSON.parse(stdout);
+    return { text: String(parsed.text || ''), confidence: Math.round((parsed.confidence || 0) * 100) };
+  } catch (_) {
+    return null;
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+  }
+}
 
 // --- OCR Text Processing Helpers ---
 
@@ -359,6 +424,14 @@ class OCRService {
   }
 
   /**
+   * True when the native Vision OCR path is usable — lets callers skip the
+   * ~300-400MB tesseract worker entirely until an actual fallback is needed.
+   */
+  async isVisionAvailable() {
+    return _visionAvailable();
+  }
+
+  /**
    * Initialize the Tesseract worker.
    */
   async initialize() {
@@ -382,6 +455,13 @@ class OCRService {
    * Returns the extracted text.
    */
   async extractText(imageBuffer) {
+    // Fast path: native Vision OCR (~1-2s). Tesseract (~6s) remains as fallback.
+    const v = await _visionExtract(imageBuffer);
+    if (v && v.text && v.text.length >= 10) {
+      const cleaned = v.text.split('\n').map(l => l.trim()).filter(Boolean).join('\n').trim();
+      return { text: cleaned, confidence: v.confidence, elapsed: 0 };
+    }
+
     if (!this.isInitialized) {
       await this.initialize();
     }
