@@ -1,7 +1,7 @@
+import './env.js'; // must stay first — loads .env before modules that snapshot process.env
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -45,14 +45,10 @@ import pendingTasksRoute from './routes/pendingTasks.js';
 import embedRoute from './routes/embed.js';
 import thoughtsRoute from './routes/thoughts.js';
 
-// Load environment variables from service directory
+// .env already loaded by ./env.js (first import) — module-scope env reads in
+// auth.js/audioJournal.js depend on that ordering.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.join(__dirname, '..', '.env') });
-// Secondary: project-root .env supplies cross-service keys (MCP_PHI4_API_KEY
-// etc.) monitorService needs to call other MCP services — comms-graph does the
-// same. override:false keeps the service-local file authoritative.
-dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env'), override: false });
 
 const app = express();
 const PORT = process.env.PORT || 3001;

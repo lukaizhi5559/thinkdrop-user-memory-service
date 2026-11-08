@@ -36,7 +36,7 @@ const AUDIO_DIR = process.env.AUDIO_JOURNAL_DIR || path.join(os.homedir(), '.thi
 const VOICE_PORT = parseInt(process.env.VOICE_SERVICE_PORT || '3006', 10);
 
 const TICK_MS = 10000;            // verdict + silence re-evaluation cadence
-const STALE_CTX_MS = 45000;       // probe heartbeats every 20s — 2 misses = dead
+const STALE_CTX_MS = 90000;       // probe heartbeats every 20s foregrounded, ~60s throttled in background tabs
 const SILENCE_CLOSE_MS = 180000;  // 3min without segments closes the session
 const MAX_SESSION_MS = 3600000;   // 1h cap — long sessions rotate into a new file
 const ERR_RETRY_MS = 60000;       // a failed capture retries at most once a minute
@@ -85,6 +85,7 @@ class AudioJournal {
   static _classifyCaptureError(msg, detail) {
     const s = `${msg || ''} ${(detail && detail.errorName) || ''}`;
     if (detail && detail.denied) return 'screen-recording-permission';
+    if (detail && detail.stalled) return 'capture-stalled';
     if (/denied|declin|no display|ScreenCapture/i.test(s) && detail && detail.source === 'td-audio-helper') return 'screen-recording-permission';
     if (/systemAudio|SystemAudioDenied|no system audio/i.test(s)) return 'system-audio';
     if (/video source|NotReadableError|NotAllowedError|Permission denied/i.test(s)) return 'screen-recording-permission';
@@ -99,6 +100,9 @@ class AudioJournal {
     }
     if (kind === 'system-audio') {
       return `${client} captured the screen but denied system audio — macOS may block SCK audio; check Screen Recording for ${client}.`;
+    }
+    if (kind === 'capture-stalled') {
+      return `${client} stalled before capture started — macOS ScreenCaptureKit (replayd) is unresponsive, often a TCC crash-loop after a client died mid-request. Restart the Mac (or log out/in), then re-check the ${client} grant in System Settings → Privacy & Security.`;
     }
     return null;
   }
