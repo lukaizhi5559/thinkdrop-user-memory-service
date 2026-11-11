@@ -978,6 +978,13 @@ export async function getActiveWindow() {
     const win = await getActiveWin();
 
     if (!win) {
+      // get-windows answered "no window" without throwing — the AppleScript
+      // frontmost read still works (no TCC) and is the only other live source.
+      if (process.platform === 'darwin') {
+        const result = await getActiveWindowAppleScript();
+        _windowCache = { result, ts: Date.now() };
+        return result;
+      }
       return { appName: 'unknown', windowTitle: 'unknown', url: null, bounds: null, filePath: null };
     }
 
@@ -1034,8 +1041,26 @@ export async function getActiveWindow() {
     _windowCache = { result, ts: Date.now() };
     return result;
   } catch (error) {
-    // get-windows binary failed — fall back to AppleScript on macOS
+    // get-windows binary failed — on macOS a TCC consent check can stall the
+    // binary (hidden prompt, upstream get-windows#150). One flagged retry
+    // skips the permission checks: name+bounds+id still come back on denied
+    // machines, then the AppleScript frontmost read covers everything else.
     if (process.platform === 'darwin') {
+      try {
+        const winNoPerm = await _execGetWindows(['--no-accessibility-permission', '--no-screen-recording-permission']);
+        if (winNoPerm?.owner?.name) {
+          const result = {
+            appName: winNoPerm.owner.name,
+            windowTitle: 'unknown',
+            url: null,
+            bounds: winNoPerm.bounds || null,
+            filePath: null,
+            windowId: winNoPerm.id || null,
+          };
+          _windowCache = { result, ts: Date.now() };
+          return result;
+        }
+      } catch (_) { /* flagged call failed too — AppleScript next */ }
       const result = await getActiveWindowAppleScript();
       _windowCache = { result, ts: Date.now() };
       return result;
