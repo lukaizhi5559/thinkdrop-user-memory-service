@@ -1,4 +1,5 @@
 import screenshot from 'screenshot-desktop';
+import { capturePng } from './nativeScreenHelper.js';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import crypto from 'crypto';
@@ -14,8 +15,19 @@ class ScreenCaptureService {
 
   /**
    * Take a screenshot and return the raw PNG buffer.
+   * macOS prefers td-screen-helper — its own TCC client ("ThinkDrop Screen
+   * Helper" in Screen Recording settings); falls back to screencapture.
    */
   async capture() {
+    if (process.platform === 'darwin') {
+      try {
+        return await capturePng();
+      } catch (e) {
+        logger.warn('td-screen-helper capture failed, trying screencapture', {
+          error: e.message, denied: !!e.denied
+        });
+      }
+    }
     try {
       const buffer = await screenshot({ format: 'png' });
       return buffer;
