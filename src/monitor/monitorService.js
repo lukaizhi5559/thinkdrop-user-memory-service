@@ -1,4 +1,5 @@
 import { getActiveWindow, isSystemIdle, isBrowserApp, _extractUrlFromRows, _normalizeUrl } from './activeWindow.js';
+import { judgeSemantic as _judgeSemantic, downscalePng as _downscalePng, postJsonLocal as _postJsonLocal, PHI4_URL, phi4Key as _phi4Key } from './semanticJudge.js';
 import { getScreenCaptureService } from './screenCapture.js';
 import OCRService, { getOCRService } from './ocrService.js';
 import { getDatabaseService } from '../services/database.js';
@@ -75,12 +76,6 @@ function notifyPersonalityService(eventType, info) {
 // a blocking AlertCurtain on the GhostLayer screen surface — visible, not
 // silently ignored. Debounced per-app so the same screen doesn't re-alert.
 const SCREEN_GUARD_ENABLED = process.env.SCREEN_GUARD !== '0';
-const PHI4_URL = process.env.PHI4_URL || `http://127.0.0.1:${process.env.PHI4_SERVICE_PORT || '3009'}`;
-// phi4 enforces API_KEY auth — comms-graph sends Bearer via decision.cjs;
-// calls without it 401 silently (judge → 'NO', guards never fire). Read lazily:
-// this module is imported before server.js's dotenv.config runs, so a top-level
-// const would capture '' forever.
-const _phi4Key = () => process.env.MCP_PHI4_API_KEY || process.env.MCP_API_KEY || '';
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 const COMMS_PORT = parseInt(process.env.THINKDROP_COMMS_PORT || '3015', 10);
 
@@ -111,40 +106,15 @@ if (_rulesMod) {
 }
 const SCREEN_GUARD_COOLDOWN_MS = parseInt(process.env.SCREEN_GUARD_COOLDOWN_MS || '90000', 10);
 // 'auto' = run the built-in guard only when no semantic observation rules are
-// enabled (they cover the same content classes with the image attached — this
+// enabled (they cover the same content classes over text+image lanes — this
 // guard sees text only). 'always' forces it on regardless.
 const SCREEN_GUARD = process.env.SCREEN_GUARD || 'auto';
 const _screenGuardLast = new Map(); // appName → last check timestamp
 
-function _postJsonLocal(port, urlPath, payload, timeoutMs = 8000, authToken = null) {
-  return new Promise((resolve) => {
-    try {
-      const body = JSON.stringify(payload);
-      const req = http.request({
-        hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
-        timeout: timeoutMs,
-      }, (res) => {
-        let raw = '';
-        res.on('data', c => { raw += c; });
-        res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (_) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => { req.destroy(); resolve(null); });
-      req.write(body);
-      req.end();
-    } catch (_) { resolve(null); }
-  });
-}
-
 async function _screenGuardCheck(appName, ocrText) {
   if (!SCREEN_GUARD_ENABLED) return;
   // Enabled semantic rules supplant this guard — same content classes, but
-  // judged with the image attached and via the reliable noul question form.
+  // judged over both the OCR text and the image via the noul question form.
   if (SCREEN_GUARD !== 'always' && _rulesMod?.hasSemanticRules?.()) return;
   const text = String(ocrText || '').replace(/\s+/g, ' ').trim();
   if (text.length < 40) return;
@@ -172,119 +142,36 @@ async function _screenGuardCheck(appName, ocrText) {
     if (verdict !== 'YES') return;
     logger.warn('[monitorService] Screen guard: unsafe content detected', { app: appName });
     await _postJsonLocal(MAIN_PORT, '/screen/display', {
+      id: 'guardian-builtin',
       kind: 'alert',
       severity: 'block',
       blocking: true,
+      locked: _rulesMod.hasPassphrase(),
       scrim: 'black',
+      opacity: 1,
       title: 'Content warning',
-      body: 'This screen may contain inappropriate content (explicit, sexual, or violent material). Please be careful — press Esc when you have moved to something safe.',
+      text: 'This screen may contain inappropriate content (explicit, sexual, or violent material). Please be careful — press Esc when you have moved to something safe.',
       mood: 'alert',
     }, 5000);
   } catch (_) { /* phi4 down → skip quietly */ }
 }
 
 // ── Semantic rule judging (guardian semanticMatch/semanticExempt) ───────────
-// Rules asserting when.semanticMatch name a content-scene ("frame") a model
-// must confirm; when.semanticExempt names the anti-frame — same vocabulary,
-// wrong scene (news/medical/scripture/fiction). Judged on deduped captures:
-// the screenshot rides as `image` (decision.answer routes it to the vision
-// model d3:2b) with OCR text as state — the frame is evidence-agnostic and
-// catches imagery OCR can't read. One eval at a time via _semEvalRunning/
-// _semEvalPending (same coalescing pattern as _pendingTick): captures landing
-// mid-eval collapse to the newest ctx and run once. Verdicts cache by
-// frame+exempt+evidence hash; model down → 'NO' (fail-open, no fire).
-const SEM_RULE_CACHE_MS = parseInt(process.env.SEMANTIC_RULE_CACHE_MS || '300000', 10);
-const SEM_RULE_MIN_TEXT = 40;
-// Min interval between judge passes — each pass is 1-2 vision-model
-// generations (~2-8s CPU on small machines). Uncapped, continuous-change
-// screens (video, scrolling) would keep moondream saturated; capped, captures
-// collapse to the freshest ctx at most once per window.
-const SEM_JUDGE_MIN_MS = parseInt(process.env.SEMANTIC_JUDGE_MIN_MS || '8000', 10);
-const _semVerdicts = new Map(); // evidence sha → {v, ts}
+// Judge lives in ./semanticJudge.js — a two-lane OR: the OCR transcript is
+// judged by the TEXT decision model (tev1; the vision model can't read a
+// 384px screenshot's text), and the screenshot by the VISION model (catches
+// imagery OCR can't read). This module only coalesces/rate-caps passes:
+// one eval at a time via _semEvalRunning/_semEvalPending (same pattern as
+// _pendingTick) — captures landing mid-eval collapse to the newest ctx and
+// run once.
+// Min interval between judge passes — a pass is normally one ~1-3s text-lane
+// call (the vision lane has its own coarser throttle in semanticJudge.js).
+// Uncapped, continuous-change screens (video, scrolling) would keep the judge
+// saturated; capped, captures collapse to the freshest ctx per window.
+const SEM_JUDGE_MIN_MS = parseInt(process.env.SEMANTIC_JUDGE_MIN_MS || '5000', 10);
 let _semEvalRunning = false;
 let _semEvalPending = null;
 let _semJudgeLastAt = 0;
-let _semJudgeWarnedAt = 0;
-
-async function _judgeSemantic(frame, exempt, ctx) {
-  const text = String(ctx.ocrText || '').replace(/\s+/g, ' ').trim();
-  const image = typeof ctx.image === 'string' && ctx.image ? ctx.image : null;
-  if (text.length < SEM_RULE_MIN_TEXT && !image) return 'NO';
-  const evKey = image
-    ? 'img:' + crypto.createHash('sha256').update(image).digest('hex')
-    : 'txt:' + text;
-  const key = crypto.createHash('sha256').update(`${frame}\n${exempt || ''}\n${evKey}`).digest('hex');
-  const hit = _semVerdicts.get(key);
-  if (hit && Date.now() - hit.ts < SEM_RULE_CACHE_MS) return hit.v;
-  const _judgeUnavailable = (res) => {
-    // Judge unreachable/denied — return NO but DO NOT cache: a cached 'NO'
-    // would keep the rule dark for 5min after phi4 recovers.
-    if (Date.now() - _semJudgeWarnedAt > 60000) {
-      _semJudgeWarnedAt = Date.now();
-      logger.warn('[monitorService] semantic judge unavailable — returning NO (uncached)', { status: res?.status || res?.error?.code || 'no-response' });
-    }
-    return 'NO';
-  };
-  const state = `App: ${ctx.appName}\nURL: ${ctx.url || ''}\nTitle: ${ctx.windowTitle || ''}\nScreen text:\n${text.slice(0, 2500)}`;
-  let verdict = 'NO';
-  try {
-    // One fused yes/no question — frame + exemption qualifier in a single
-    // model pass. Verified empirically on this machine's judge models:
-    // lettered YES/NO choices produce false-YESes (first-option attractor)
-    // and the enumerated exempt prompt returns empty from moondream; plain
-    // "Answer yes or no" (noul) answers correctly on both tev1 and moondream
-    // — and one inference instead of two halves judge cost.
-    const res = await _postJsonLocal(new URL(PHI4_URL).port || 3009, '/decision.answer', {
-      version: 'mcp.v1',
-      service: 'phi4',
-      action: 'decision.answer',
-      requestId: 'sr_' + Date.now(),
-      payload: {
-        state,
-        questions: [{
-          id: 'match', type: 'noul',
-          question: exempt == null
-            ? `Does this screen content present "${frame}" as the actual material itself — not a news article, medical page, or quote about it?`
-            : `Does this screen content present "${frame}" as the actual material itself — not ${exempt}?`,
-        }],
-        ...(image ? { image } : {}),
-      },
-    }, 15000, _phi4Key());
-    if (res?.status !== 'ok') return _judgeUnavailable(res);
-    verdict = res?.data?.answers?.match?.bool === true ? 'YES' : 'NO';
-  } catch (_) { /* phi4/vision down → no match */ }
-  if (_semVerdicts.size > 200) _semVerdicts.clear();
-  _semVerdicts.set(key, { v: verdict, ts: Date.now() });
-  return verdict;
-}
-
-// Downscale a PNG for the semantic judge — a full-retina shot is multi-MB
-// base64 and stalls the vision POST + moondream inference (encode cost scales
-// with pixels). moondream resizes input to ~378px internally, so ~384px loses
-// nothing the model would see and encodes ~4x cheaper than 720px.
-// Nearest-neighbor stride sampling, ~50ms.
-function _downscalePng(buffer, targetW = parseInt(process.env.SEM_JUDGE_IMAGE_W || '384', 10)) {
-  try {
-    const png = PNG.sync.read(buffer);
-    if (png.width <= targetW) return buffer;
-    const scale = png.width / targetW;
-    const W = targetW;
-    const H = Math.max(1, Math.round(png.height / scale));
-    const out = new PNG({ width: W, height: H });
-    for (let y = 0; y < H; y++) {
-      const sy = Math.min(png.height - 1, Math.floor(y * scale));
-      for (let x = 0; x < W; x++) {
-        const sx = Math.min(png.width - 1, Math.floor(x * scale));
-        const s = (sy * png.width + sx) * 4;
-        const d = (y * W + x) * 4;
-        for (let k = 0; k < 4; k++) out.data[d + k] = png.data[s + k];
-      }
-    }
-    return PNG.sync.write(out);
-  } catch (_) {
-    return buffer;
-  }
-}
 
 const KNOWN_APPS = {
   'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
@@ -555,6 +442,15 @@ class MonitorService extends EventEmitter {
     const action = t.action || 'notify';
     if (action === 'show_card' || action === 'block' || action === 'notify') {
       _postJsonLocal(MAIN_PORT, '/screen/display', {
+        // Stable display id for guard actions — block/ask are guard actions so
+        // cooldown never throttles them; without an id every re-fire minted a
+        // NEW display and stacked duplicate curtains on screen.
+        ...(action === 'block' ? {
+          id: `guardian-block-${rule.id}`,
+          ruleId: rule.id,
+          locked: _rulesMod.hasPassphrase(),
+          opacity: 1,
+        } : {}),
         kind: t.kind || 'alert',
         severity: action === 'block' ? 'block' : (t.severity || 'info'),
         blocking: action === 'block',
@@ -562,7 +458,7 @@ class MonitorService extends EventEmitter {
         ...(t.emoji ? { emoji: t.emoji } : {}),
         ...(typeof t.durationMs === 'number' ? { durationMs: t.durationMs } : {}),
         title: t.title || (t.kind === 'emoji' ? undefined : `Guardian rule ${rule.id}`),
-        body: t.body || t.reason || t.msg || undefined,
+        text: t.body || t.reason || t.msg || undefined,
         mood: t.mood || (action === 'block' ? 'alert' : 'neutral'),
       }, 5000).catch(() => {});
     } else if (action === 'enqueue_task' && t.prompt) {
@@ -575,9 +471,13 @@ class MonitorService extends EventEmitter {
     } else if (action === 'ask') {
       // No interactive path on this seam — surface as a blocking card.
       _postJsonLocal(MAIN_PORT, '/screen/display', {
-        kind: 'alert', severity: 'block', blocking: true, scrim: 'black',
+        id: `guardian-ask-${rule.id}`,
+        ruleId: rule.id,
+        kind: 'alert', severity: 'block', blocking: true,
+        locked: _rulesMod.hasPassphrase(),
+        scrim: 'black', opacity: 1,
         title: `Guardian rule ${rule.id}`,
-        body: t.body || t.reason || 'Restricted — a passphrase holder can manage rules via guardian commands.',
+        text: t.body || t.reason || 'Restricted — a passphrase holder can manage rules via guardian commands.',
         mood: 'alert',
       }, 5000).catch(() => {});
     }
